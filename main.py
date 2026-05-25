@@ -12,6 +12,11 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+_SUPPORTED_UPLOAD_EXTS = {
+    ".pdf", ".txt", ".md", ".docx", ".csv",
+    ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wav",
+}
+
 # ---------------------------------------------------------------------------
 # Async helper – runs coroutines in a background thread so the GUI stays
 # responsive.  Every public API call goes through this.
@@ -80,6 +85,10 @@ class NotebookLMApp(ctk.CTk):
         self.notebooks: list = []
         self.selected_nb_id: str | None = None
         self._file_to_upload: Path | None = None
+        self._folder_to_upload: Path | None = None
+        self._sources_cache: list = []
+        self._source_display_to_id: dict[str, str] = {}
+        self._selected_source_id: str | None = None
 
         self._build_ui()
 
@@ -146,6 +155,39 @@ class NotebookLMApp(ctk.CTk):
         ctk.CTkButton(mid_frame, text="➕ Добавить URL", width=160, command=self._add_url_source).grid(
             row=2, column=2, padx=(4, 10), pady=(4, 8)
         )
+
+        # -- Manage existing sources row --
+        ctk.CTkLabel(mid_frame, text="🗑 Source:").grid(row=3, column=0, padx=(10, 4), pady=(4, 8), sticky="w")
+        self.cb_sources = ctk.CTkComboBox(
+            mid_frame,
+            values=["-- выберите блокнот --"],
+            state="readonly",
+            command=self._on_source_selected,
+        )
+        self.cb_sources.grid(row=3, column=1, padx=4, pady=(4, 8), sticky="ew")
+
+        src_manage_btns = ctk.CTkFrame(mid_frame, fg_color="transparent")
+        src_manage_btns.grid(row=3, column=2, padx=(4, 10), pady=(4, 8), sticky="e")
+        ctk.CTkButton(src_manage_btns, text="🔄", width=44, command=self._refresh_sources_combo).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(src_manage_btns, text="🗑 Удалить", width=110, command=self._delete_selected_source).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(src_manage_btns, text="☢ Удалить ВСЕ", width=130, command=self._delete_all_sources).pack(side="left")
+
+        # -- Bulk reupload row --
+        ctk.CTkLabel(mid_frame, text="📁 Reupload:").grid(row=4, column=0, padx=(10, 4), pady=(0, 10), sticky="w")
+        self.lbl_folder = ctk.CTkLabel(mid_frame, text="папка не выбрана", text_color="gray")
+        self.lbl_folder.grid(row=4, column=1, padx=4, pady=(0, 10), sticky="w")
+
+        folder_btns = ctk.CTkFrame(mid_frame, fg_color="transparent")
+        folder_btns.grid(row=4, column=2, padx=(4, 10), pady=(0, 10), sticky="e")
+        ctk.CTkButton(folder_btns, text="📂 Выбрать папку", width=120, command=self._choose_folder_upload).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(folder_btns, text="⬆ Reupload Folder", width=150, command=self._reupload_folder).pack(side="left")
+
+        # -- Operation progress row --
+        self.lbl_op_progress = ctk.CTkLabel(mid_frame, text="Progress: 0%", text_color="gray")
+        self.lbl_op_progress.grid(row=5, column=0, padx=(10, 4), pady=(0, 10), sticky="w")
+        self.pb_op = ctk.CTkProgressBar(mid_frame, height=12)
+        self.pb_op.grid(row=5, column=1, padx=4, pady=(0, 10), sticky="ew")
+        self.pb_op.set(0)
 
         # === 3. CHAT AREA ===
         chat_frame = ctk.CTkFrame(self, corner_radius=8)
@@ -279,6 +321,7 @@ class NotebookLMApp(ctk.CTk):
         self.selected_nb_id = nbs[0].id
         # Fetch source count for the first selected notebook
         self._fetch_source_count(nbs[0].id, nbs[0].title)
+        self._refresh_sources_combo()
 
     def _on_notebook_selected(self, choice: str):
         idx = self.cb_notebooks.cget("values").index(choice) if choice in self.cb_notebooks.cget("values") else -1
@@ -286,6 +329,63 @@ class NotebookLMApp(ctk.CTk):
             self.selected_nb_id = self.notebooks[idx].id
             self._chat_append(f"[SYSTEM] Выбран блокнот: {self.notebooks[idx].title}")
             self._fetch_source_count(self.notebooks[idx].id, self.notebooks[idx].title)
+            self._refresh_sources_combo()
+
+    def _source_id_of(self, src) -> str | None:
+        for attr in ("id", "source_id", "uuid"):
+            val = getattr(src, attr, None)
+            if val:
+                return str(val)
+        return None
+
+    def _source_title_of(self, src) -> str:
+        return str(getattr(src, "title", "—"))
+
+    def _source_kind_of(self, src) -> str:
+        return str(getattr(src, "kind", "?"))
+
+    def _populate_sources(self, sources: list):
+        self._sources_cache = list(sources)
+        self._source_display_to_id = {}
+        values = []
+        for i, src in enumerate(sources, 1):
+            sid = self._source_id_of(src)
+            if not sid:
+                continue
+            display = f"{i}. [{self._source_kind_of(src)}] {self._source_title_of(src)}"
+            self._source_display_to_id[display] = sid
+            values.append(display)
+
+        if not values:
+            self._selected_source_id = None
+            self.cb_sources.configure(values=["-- источников нет --"])
+            self.cb_sources.set("-- источников нет --")
+            return
+
+        self.cb_sources.configure(values=values)
+        self.cb_sources.set(values[0])
+        self._selected_source_id = self._source_display_to_id.get(values[0])
+
+    def _on_source_selected(self, choice: str):
+        self._selected_source_id = self._source_display_to_id.get(choice)
+
+    def _refresh_sources_combo(self):
+        if not self.client or not self.selected_nb_id:
+            self.cb_sources.configure(values=["-- сначала подключитесь --"])
+            self.cb_sources.set("-- сначала подключитесь --")
+            self._selected_source_id = None
+            return
+
+        nb_id = self.selected_nb_id
+
+        async def _fetch():
+            return await self.client.sources.list(nb_id)
+
+        def _ok(sources):
+            self._populate_sources(sources)
+            self._chat_append(f"[SOURCES] Обновлено: {len(sources)}")
+
+        self._schedule(_fetch(), on_success=_ok)
 
     def _fetch_source_count(self, nb_id: str, title: str):
         """Fetch actual source count for a notebook."""
@@ -317,6 +417,20 @@ class NotebookLMApp(ctk.CTk):
         self._schedule(_fetch(), on_success=_ok)
 
     # ---------------------------------------------------- Sources ----------
+    def _set_progress(self, current: int, total: int, prefix: str = "Progress"):
+        if total <= 0:
+            pct = 0
+            value = 0.0
+        else:
+            value = max(0.0, min(current / total, 1.0))
+            pct = round(value * 100)
+        self.pb_op.set(value)
+        self.lbl_op_progress.configure(text=f"{prefix}: {pct}% ({current}/{total})")
+
+    def _reset_progress(self):
+        self.pb_op.set(0)
+        self.lbl_op_progress.configure(text="Progress: 0%")
+
     def _choose_file(self):
         path = filedialog.askopenfilename(
             title="Выберите файл для загрузки",
@@ -391,6 +505,7 @@ class NotebookLMApp(ctk.CTk):
             return await self.client.sources.list(nb_id)
 
         def _ok(sources):
+            self._populate_sources(sources)
             if not sources:
                 self._chat_append("[SOURCES] Источников нет.")
                 return
@@ -401,6 +516,161 @@ class NotebookLMApp(ctk.CTk):
                 self._chat_append(f"  {i}. [{kind}] {title}")
 
         self._schedule(_fetch(), on_success=_ok)
+
+    async def _delete_source_api(self, notebook_id: str, source_id: str):
+        """Try supported delete/remove signatures from notebooklm-py versions."""
+        mgr = self.client.sources
+        variants = [
+            ("delete", (notebook_id, source_id)),
+            ("delete", (source_id,)),
+            ("remove", (notebook_id, source_id)),
+            ("remove", (source_id,)),
+        ]
+
+        for method_name, args in variants:
+            fn = getattr(mgr, method_name, None)
+            if not fn:
+                continue
+            try:
+                result = fn(*args)
+                if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+                    return await result
+                return result
+            except TypeError:
+                continue
+
+        raise RuntimeError(
+            "NotebookLM API does not expose sources.delete/remove in this version."
+        )
+
+    def _delete_selected_source(self):
+        if not self.client or not self.selected_nb_id:
+            messagebox.showwarning("Нет подключения", "Сначала подключитесь и выберите блокнот.")
+            return
+        if not self._selected_source_id:
+            messagebox.showwarning("Источник", "Выберите источник для удаления.")
+            return
+
+        if not messagebox.askyesno("Подтверждение", "Удалить выбранный источник из блокнота?"):
+            return
+
+        nb_id = self.selected_nb_id
+        src_id = self._selected_source_id
+
+        async def _delete_one():
+            return await self._delete_source_api(nb_id, src_id)
+
+        def _ok(_):
+            self._chat_append("[DELETE] Источник удален.")
+            self._refresh_sources_combo()
+
+        self._schedule(_delete_one(), on_success=_ok)
+
+    def _delete_all_sources(self):
+        if not self.client or not self.selected_nb_id:
+            messagebox.showwarning("Нет подключения", "Сначала подключитесь и выберите блокнот.")
+            return
+
+        if not messagebox.askyesno(
+            "ОПАСНО",
+            "Удалить ВСЕ источники в выбранном блокноте?\nЭто действие необратимо.",
+        ):
+            return
+
+        nb_id = self.selected_nb_id
+
+        async def _wipe_all():
+            sources = await self.client.sources.list(nb_id)
+            total = len(sources)
+            deleted = 0
+            errors = 0
+            self.after(0, lambda: self._set_progress(0, total, "Delete all"))
+            for src in sources:
+                sid = self._source_id_of(src)
+                if not sid:
+                    errors += 1
+                    done = deleted + errors
+                    self.after(0, lambda d=done, t=total: self._set_progress(d, t, "Delete all"))
+                    continue
+                try:
+                    await self._delete_source_api(nb_id, sid)
+                    deleted += 1
+                    title = self._source_title_of(src)
+                    self.after(0, lambda t=title: self._chat_append(f"  🗑 {t}"))
+                except Exception as e:
+                    errors += 1
+                    title = self._source_title_of(src)
+                    self.after(0, lambda t=title, err=str(e): self._chat_append(f"  ❌ {t}: {err}"))
+                done = deleted + errors
+                self.after(0, lambda d=done, t=total: self._set_progress(d, t, "Delete all"))
+            return deleted, errors
+
+        def _ok(result):
+            deleted, errors = result
+            self._chat_append(f"[DELETE ALL] Готово: удалено {deleted}, ошибок {errors}")
+            self._set_progress(deleted + errors, max(deleted + errors, 1), "Delete all")
+            self._refresh_sources_combo()
+
+        self._schedule(_wipe_all(), on_success=_ok)
+
+    def _choose_folder_upload(self):
+        folder = filedialog.askdirectory(title="Выберите папку для полной перезагрузки")
+        if folder:
+            self._folder_to_upload = Path(folder)
+            self.lbl_folder.configure(text=self._folder_to_upload.name, text_color="white")
+
+    def _reupload_folder(self):
+        if not self.client:
+            messagebox.showwarning("Нет подключения", "Сначала подключитесь.")
+            return
+        if not self.selected_nb_id:
+            messagebox.showwarning("Блокнот", "Выберите блокнот.")
+            return
+        if not self._folder_to_upload or not self._folder_to_upload.exists():
+            messagebox.showwarning("Папка", "Сначала выберите папку для загрузки.")
+            return
+
+        files = [
+            f for f in sorted(self._folder_to_upload.rglob('*'))
+            if f.is_file() and not f.name.startswith('.') and f.suffix.lower() in _SUPPORTED_UPLOAD_EXTS
+        ]
+        if not files:
+            messagebox.showwarning("Папка", "Подходящие файлы не найдены.")
+            return
+
+        if not messagebox.askyesno(
+            "Reupload Folder",
+            f"Загрузить {len(files)} файлов в выбранный блокнот?",
+        ):
+            return
+
+        nb_id = self.selected_nb_id
+        self._chat_append(f"[REUPLOAD] Старт: {len(files)} файлов из {self._folder_to_upload}")
+
+        async def _upload_all():
+            total = len(files)
+            uploaded = 0
+            errors = 0
+            self.after(0, lambda: self._set_progress(0, total, "Reupload"))
+            for i, fpath in enumerate(files, 1):
+                try:
+                    await self.client.sources.add_file(nb_id, fpath)
+                    uploaded += 1
+                    self.after(0, lambda n=fpath.name, a=i, t=total: self._chat_append(f"  ☁️ [{a}/{t}] {n}"))
+                except Exception as e:
+                    errors += 1
+                    self.after(0, lambda n=fpath.name, err=str(e): self._chat_append(f"  ❌ {n}: {err}"))
+                done = uploaded + errors
+                self.after(0, lambda d=done, t=total: self._set_progress(d, t, "Reupload"))
+            return uploaded, errors
+
+        def _ok(result):
+            uploaded, errors = result
+            self._chat_append(f"[REUPLOAD] Готово: загружено {uploaded}, ошибок {errors}")
+            self._set_progress(uploaded + errors, max(uploaded + errors, 1), "Reupload")
+            self._refresh_sources_combo()
+
+        self._schedule(_upload_all(), on_success=_ok)
 
     # ---------------------------------------------------- Chat -------------
     def _send_query(self):
