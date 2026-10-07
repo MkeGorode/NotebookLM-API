@@ -12,6 +12,8 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from core_notebooklm import NotebookLMSync
+
 _SUPPORTED_UPLOAD_EXTS = {
     ".pdf", ".txt", ".md", ".docx", ".csv",
     ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wav",
@@ -252,13 +254,10 @@ class NotebookLMApp(ctk.CTk):
 
     # ---------------------------------------------------- Auth / connect ---
     async def _connect(self, path: str | None = None):
-        from notebooklm import NotebookLMClient
-        storage = path if path else None
-        client = await NotebookLMClient.from_storage(storage)
-        await client.__aenter__()
-        # Quick smoke-test: list notebooks
-        nbs = await client.notebooks.list()
-        return client, nbs
+        # NotebookLMSync.connect применяет патч домена notebook.google.com
+        sync = NotebookLMSync(path)
+        nbs = await sync.connect()
+        return sync.client, nbs
 
     def _test_connection(self):
         self.lbl_auth_status.configure(text="Статус: подключение…", text_color="orange")
@@ -279,35 +278,33 @@ class NotebookLMApp(ctk.CTk):
         self._schedule(self._connect(path), on_success=_ok, on_error=_err)
 
     def _browser_login(self):
-        """Run `notebooklm login` in a subprocess (opens browser)."""
-        try:
-            self.lbl_auth_status.configure(text="Статус: открывается браузер для входа…", text_color="orange")
-            self._chat_append("[SYSTEM] Запуск notebooklm login — откроется браузер…")
-            threading.Thread(target=self._run_login_subprocess, daemon=True).start()
-        except Exception as e:
-            messagebox.showerror("Login Error", str(e))
+        """Вход через Playwright (Edge) на notebook.google.com; сессия сохраняется в storage notebooklm-py."""
+        self.lbl_auth_status.configure(text="Статус: открывается браузер для входа…", text_color="orange")
+        self._chat_append("[SYSTEM] Откроется браузер — войдите в Google, затем подтвердите в окне программы.")
+        threading.Thread(target=self._run_login, daemon=True).start()
 
-    def _run_login_subprocess(self):
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "notebooklm", "login"],
-                capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode == 0:
-                self.after(0, lambda: self.lbl_auth_status.configure(
-                    text="✅ Вход выполнен — нажмите Test Connection", text_color="green"))
-                self.after(0, lambda: self._chat_append("[SYSTEM] Browser login завершён. Нажмите 'Test Connection'."))
-            else:
-                err = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                self.after(0, lambda: messagebox.showerror("Login Error", err))
-                self.after(0, lambda: self.lbl_auth_status.configure(
-                    text=f"❌ Login failed", text_color="red"))
-        except subprocess.TimeoutExpired:
-            self.after(0, lambda: messagebox.showwarning("Timeout", "Login timed out (5 min)."))
-        except FileNotFoundError:
-            self.after(0, lambda: messagebox.showerror(
-                "Not Found",
-                "notebooklm CLI not found.\n\nУстановите: pip install 'notebooklm-py[browser]'\nЗатем: playwright install chromium"))
+    def _run_login(self):
+        def _confirm() -> bool:
+            done, answer = threading.Event(), []
+
+            def _ask():
+                answer.append(messagebox.askokcancel(
+                    "Вход в NotebookLM",
+                    "Войдите в Google в открывшемся браузере.\nКогда увидите список блокнотов — нажмите OK."))
+                done.set()
+
+            self.after(0, _ask)
+            done.wait()
+            return answer[0]
+
+        ok, msg = NotebookLMSync.browser_login(wait_callback=_confirm)
+        if ok:
+            self.after(0, lambda: self.lbl_auth_status.configure(
+                text="✅ Вход выполнен — нажмите Test Connection", text_color="green"))
+            self.after(0, lambda: self._chat_append("[SYSTEM] Вход завершён. Нажмите 'Test Connection'."))
+        else:
+            self.after(0, lambda: messagebox.showerror("Login Error", msg))
+            self.after(0, lambda: self.lbl_auth_status.configure(text="❌ Login failed", text_color="red"))
 
     # ---------------------------------------------------- Notebooks --------
     def _populate_notebooks(self, nbs):
