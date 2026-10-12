@@ -369,10 +369,10 @@ class NotebookLMApp(ctk.CTk):
         add = ctk.CTkFrame(side, fg_color="transparent")
         add.grid(row=8, column=0, pady=(10, 14), sticky="ew", **pad)
         add.grid_columnconfigure(0, weight=1)
-        self.url_entry = self._entry(add, "Вставьте ссылку и нажмите Enter")
+        self.url_entry = self._entry(add, "Ссылка, путь к файлу или папке…")
         self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.url_entry.bind("<Return>", lambda _: self._add_url_source())
-        self._btn(add, "＋", self._add_url_source, "secondary", 34).grid(row=0, column=1)
+        self._btn(add, "Добавить", self._add_url_source, "secondary", 80).grid(row=0, column=1)
         self._btn(add, "📄 Добавить файлы…", self._add_files, "secondary", 120).grid(
             row=1, column=0, columnspan=2, pady=(6, 0), sticky="ew")
 
@@ -1203,11 +1203,32 @@ class NotebookLMApp(ctk.CTk):
                         lambda ev: eng.upload_many(client, nb_id, files, conc, ev))
 
     def _add_url_source(self):
+        """Add a source from the entry: URL → web source, file path → upload, folder path → source folder.
+
+        With an empty entry the file picker opens instead.
+        """
+        raw = self.url_entry.get().strip().strip('"')
+        if not raw:
+            self._add_files()
+            return
+        local = Path(raw).expanduser()
+        if not raw.lower().startswith(("http://", "https://", "www.")) and local.exists():
+            self.url_entry.delete(0, "end")
+            if local.is_dir():
+                self._set_folder(local)
+                self._autosave(folder=str(local))
+                self._log(f"[FOLDER] {local} · {len(self._folder_files)} файлов")
+                self.tabs.set(TAB_SYNC)
+                return
+            if not self._require_notebook():
+                return
+            client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
+            self._start_job("Загрузка файлов", local.name, nb_id, self._selected_nb_title(),
+                            lambda ev: eng.upload_many(client, nb_id, [local], conc, ev))
+            return
         if not self._require_notebook():
             return
-        url = self.url_entry.get().strip()
-        if not url:
-            return
+        url = raw if "://" in raw else "https://" + raw
         nb_id, client = self.selected_nb_id, self.client
 
         async def _add():
