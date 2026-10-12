@@ -137,13 +137,20 @@ async def cmd_diff(args, store, clients):
     for t in _targets(args, store):
         client, nb = await _notebook(clients, t)
         files = eng.folder_files(t.folder)
-        d = eng.folder_diff(files, await client.sources.list(nb.id))
+        d = eng.folder_diff(files, await client.sources.list(nb.id), store.index_pattern)
         print(f"== [{t.label}] {nb.title}: папка {d['files']} · блокнот {d['sources']} · "
-              f"новых {len(d['new'])} · лишних {len(d['orphans'])}")
+              f"загрузить {len(d['upload'])} · удалить {len(d['delete'])}")
         for f in d["new"]:
             print(f"  + {f.name}")
-        for _, title in d["orphans"]:
+        for f in d["changed"]:
+            print(f"  ~ {f.name} (изменён после загрузки)")
+        for f in d["index_upload"]:
+            print(f"  ★ {f.name} (свежий индекс)")
+        for _, title in d["delete"]:
             print(f"  - {title}")
+        for f in d["stale_index"]:
+            rel = f.relative_to(t.folder) if t.folder and f.is_relative_to(t.folder) else f.name
+            print(f"  · {rel} (старая версия индекса, пропускается)")
 
 
 async def _bulk(args, store, clients, op_name: str):
@@ -167,10 +174,23 @@ async def _bulk(args, store, clients, op_name: str):
     async def _run(t: Target, files):
         client, nb = await _notebook(clients, t)
         print(f"[{t.label}] {op_name} → {nb.title}: {len(files)} файлов, параллельно {args.jobs}")
-        res = await op(client, nb.id, files, args.jobs, _printer(t.label, args.quiet))
+        printer = _printer(t.label, args.quiet)
+        res = await op(client, nb.id, files, args.jobs, printer, store.index_pattern)
         status = "ПРЕРВАНО (не все источники удалены)" if res["aborted"] else "готово"
         print(f"[{t.label}] {status}: удалено {res['deleted']}, загружено {res['uploaded']}, "
-              f"ошибок {res['delete_errors'] + res['upload_errors']}")
+              f"ошибок {res['delete_errors'] + res['upload_errors']}"
+              + (f", индекс: {', '.join(res['index'])}" if res.get("index") else ""))
+        enabled, prompt = store.post_prompt(t.label if t.label in store.presets else None)
+        if args.ask is not None:
+            enabled, prompt = True, args.ask
+        if enabled and not args.no_ask:
+            try:
+                qa = await eng.ask_after_sync(client, nb.id, nb.title, prompt, res, printer)
+            except Exception as exc:
+                qa = None
+                print(f"[{t.label}] ⚠ вопрос в чат не удался: {exc}", file=sys.stderr)
+            if qa:
+                print(f"\n[{t.label}] 🧑 {qa['question']}\n[{t.label}] 🤖 {qa['answer']}\n")
         return res
 
     started = time.monotonic()
@@ -234,6 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=hlp)
         targets(sp, folder=True)
         sp.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение")
+        sp.add_argument("--no-ask", action="store_true", help="не задавать вопрос в чат после синхронизации")
+        sp.add_argument("--ask", help="свой вопрос после синхронизации ({new_files}, {notebook}, {date})")
     up = sub.add_parser("upload", help="загрузить файлы")
     up.add_argument("-n", "--notebook", required=True)
     up.add_argument("files", nargs="+")

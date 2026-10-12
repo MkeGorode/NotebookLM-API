@@ -11,6 +11,8 @@ import threading
 from datetime import datetime
 import subprocess
 import sys
+import tkinter
+import tkinter.font
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -45,8 +47,10 @@ NOT_CONNECTED = "Сначала подключитесь"
 NO_PRESETS = "— нет шаблонов —"
 SEND_TEXT = "Отправить ➤"
 PRESET_FIELD_NAMES = {"folder": "папка", "notebook_id": "блокнот", "notebook_title": "блокнот",
+                      "ask_after": "вопрос после синхронизации", "post_prompt": "вопрос после синхронизации",
                       "storage_path": "storage"}
-PHASE_NAMES = {"delete": "Удаление", "upload": "Загрузка"}
+PHASE_NAMES = {"delete": "Удаление", "upload": "Загрузка", "processing": "Обработка в NotebookLM",
+               "ask": "Вопрос в чат"}
 
 
 def _kind_icon(kind: str) -> str:
@@ -111,6 +115,28 @@ def run_async(coro, on_success=None, on_error=None):
 # Main application
 # ---------------------------------------------------------------------------
 
+def _guard_tk_finalizers(post_to_main):
+    """Tk objects must only be finalized on the main thread.
+
+    Python's GC may run on the asyncio worker thread and call Font/Variable/Image.__del__ there,
+    which deadlocks Tk. Such finalizers are forwarded to the main thread instead.
+    """
+    main_thread = threading.main_thread()
+    for cls in (tkinter.font.Font, tkinter.Variable, tkinter.Image):
+        original = cls.__dict__.get("__del__")
+        if original is None or getattr(original, "_main_thread_guard", False):
+            continue
+
+        def guarded(self, _orig=original):
+            if threading.current_thread() is main_thread:
+                _orig(self)
+            else:
+                post_to_main(lambda: _orig(self))
+
+        guarded._main_thread_guard = True
+        cls.__del__ = guarded
+
+
 class NotebookLMApp(ctk.CTk):
     APP_TITLE = "NotebookLM Desktop Client"
 
@@ -146,6 +172,8 @@ class NotebookLMApp(ctk.CTk):
         self._jobs_placeholder = None
 
         self._ui_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._fonts: dict = {}
+        _guard_tk_finalizers(self._ui)
         self._build_ui()
         self._drain_ui()
         self.storage_entry.bind("<FocusOut>", lambda _e: self._autosave(storage_path=self.storage_entry.get().strip()))
@@ -170,7 +198,11 @@ class NotebookLMApp(ctk.CTk):
     # ------------------------------------------------------------------ UI --
     # Widget factories keep the Fluent look consistent
     def _font(self, size: int = 12, weight: str = "normal"):
-        return ctk.CTkFont(family=FONT, size=size, weight=weight)
+        key = (size, weight)
+        font = self._fonts.get(key)
+        if font is None:
+            font = self._fonts[key] = ctk.CTkFont(family=FONT, size=size, weight=weight)
+        return font
 
     def _panel(self, parent, **kw):
         return ctk.CTkFrame(parent, corner_radius=8, fg_color=kw.pop("fg_color", COLORS["surface"]),
@@ -353,7 +385,7 @@ class NotebookLMApp(ctk.CTk):
 
     def _build_sync_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(5, weight=1)
+        tab.grid_rowconfigure(6, weight=1)
         self._title(tab, "Синхронизация папки с блокнотом").grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
         self._hint(tab, "Папка и блокнот запоминаются в активном шаблоне. Выбор папки ничего не меняет в блокноте — "
                         "ниже видно, чем они отличаются.", 700).grid(row=1, column=0, padx=10, pady=(0, 10), sticky="w")
@@ -377,7 +409,7 @@ class NotebookLMApp(ctk.CTk):
         actions.grid_columnconfigure(1, weight=1)
         rows = (
             ("⇄  Синхронизировать", self._sync_folder, "primary",
-             "Быстро: загружает только новые файлы и удаляет источники, файлов которых больше нет."),
+             "Быстро: новые и изменённые файлы, самый свежий индекс; удаляет источники без файла."),
             ("♻  Reload", self._reload_folder, "secondary",
              "Полностью: удаляет ВСЕ источники и загружает папку заново."),
             ("▶  Несколько шаблонов…", self._open_multi_dialog, "secondary",
@@ -389,15 +421,33 @@ class NotebookLMApp(ctk.CTk):
             self._hint(actions, hint, 460).grid(row=i, column=1, padx=14, pady=(0, 8), sticky="w")
         self.btn_reload = actions.grid_slaves(row=1, column=0)[0]
 
+        ask = self._panel(tab, fg_color=COLORS["background"])
+        ask.grid(row=4, column=0, padx=10, pady=(4, 0), sticky="ew")
+        ask.grid_columnconfigure(0, weight=1)
+        self.var_ask = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(ask, text="После синхронизации задать вопрос в чат (ждёт обработки новых источников)",
+                        variable=self.var_ask, command=self._on_prompt_changed, font=self._font(12, "bold"),
+                        text_color=COLORS["text"], fg_color=COLORS["primary"], hover_color=COLORS["primary_hover"],
+                        checkbox_width=18, checkbox_height=18).grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
+        self._btn(ask, "По умолчанию", self._reset_prompt, "ghost", 110, 24).grid(row=0, column=1, padx=8, pady=(10, 4))
+        self.txt_prompt = ctk.CTkTextbox(ask, height=64, wrap="word", corner_radius=4, fg_color=COLORS["surface"],
+                                         border_width=1, border_color=COLORS["border"], text_color=COLORS["text"],
+                                         font=self._font(12))
+        self.txt_prompt.grid(row=1, column=0, columnspan=2, padx=12, sticky="ew")
+        self.txt_prompt.insert("1.0", eng.DEFAULT_POST_PROMPT)
+        self.txt_prompt.bind("<FocusOut>", lambda _e: self._on_prompt_changed())
+        self._hint(ask, "Подстановки: {new_files} — список загруженных файлов, {notebook} — блокнот, {date} — дата. "
+                        "Сохраняется в шаблоне.", 640).grid(row=2, column=0, columnspan=2, padx=12, pady=(2, 10), sticky="w")
+
         jhead = ctk.CTkFrame(tab, fg_color="transparent")
-        jhead.grid(row=4, column=0, padx=10, pady=(8, 4), sticky="ew")
+        jhead.grid(row=5, column=0, padx=10, pady=(8, 4), sticky="ew")
         jhead.grid_columnconfigure(0, weight=1)
         self._section(jhead, "Задачи").grid(row=0, column=0, sticky="w")
         self._btn(jhead, "Удалить все источники…", self._delete_all_sources, "ghost", 170, 24).grid(row=0, column=1)
 
         self.jobs_list = ctk.CTkScrollableFrame(tab, fg_color=COLORS["surface"], corner_radius=6,
                                                 border_width=1, border_color=COLORS["border"])
-        self.jobs_list.grid(row=5, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        self.jobs_list.grid(row=6, column=0, padx=10, pady=(0, 10), sticky="nsew")
         self._show_jobs_placeholder()
 
     def _build_log_tab(self, tab):
@@ -448,6 +498,42 @@ class NotebookLMApp(ctk.CTk):
         self.cb_concurrency.configure(width=80)
         self.cb_concurrency.set(str(self.presets.concurrency))
         self.cb_concurrency.pack(side="left")
+
+        self._title(tab, "Индекс-файлы").grid(row=10, column=0, padx=10, pady=(20, 2), sticky="w")
+        self._hint(tab, "Файлы, в имени которых есть этот текст, считаются версиями индекса: при синхронизации в "
+                        "блокноте остаётся только самый свежий (по дате в имени, иначе по времени изменения).").grid(
+            row=11, column=0, padx=10, pady=(0, 8), sticky="w")
+        idx = ctk.CTkFrame(tab, fg_color="transparent")
+        idx.grid(row=12, column=0, padx=10, sticky="w")
+        self._label(idx, "Имя содержит:").pack(side="left", padx=(0, 8))
+        self.entry_index = self._entry(idx, "INDEX")
+        self.entry_index.configure(width=160)
+        self.entry_index.insert(0, self.presets.index_pattern)
+        self.entry_index.pack(side="left")
+        self.entry_index.bind("<FocusOut>", lambda _e: self._on_index_pattern())
+        self.entry_index.bind("<Return>", lambda _e: self._on_index_pattern())
+
+    def _on_index_pattern(self):
+        value = self.entry_index.get().strip()
+        if value != self.presets.index_pattern:
+            self.presets.index_pattern = value
+            self._log(f"[SETTINGS] Индекс-файлы: «{value or '—'}»")
+            self._update_diff()
+
+    def _prompt_text(self) -> str:
+        return self.txt_prompt.get("1.0", "end").strip()
+
+    def _set_prompt_widgets(self, enabled: bool, text: str):
+        self.var_ask.set(enabled)
+        self.txt_prompt.delete("1.0", "end")
+        self.txt_prompt.insert("1.0", text)
+
+    def _on_prompt_changed(self):
+        self._autosave(ask_after=bool(self.var_ask.get()), post_prompt=self._prompt_text())
+
+    def _reset_prompt(self):
+        self._set_prompt_widgets(bool(self.var_ask.get()), eng.DEFAULT_POST_PROMPT)
+        self._on_prompt_changed()
 
     def _on_concurrency(self, value: str):
         self.presets.concurrency = int(value)
@@ -585,6 +671,8 @@ class NotebookLMApp(ctk.CTk):
             "folder": str(self._folder_to_upload) if self._folder_to_upload else "",
             "notebook_id": self.selected_nb_id or "",
             "notebook_title": getattr(nb, "title", "") if nb else "",
+            "ask_after": bool(self.var_ask.get()),
+            "post_prompt": self._prompt_text(),
         }
 
     def _autosave(self, **fields):
@@ -633,6 +721,7 @@ class NotebookLMApp(ctk.CTk):
             else:
                 self._clear_folder()
 
+            self._set_prompt_widgets(*self.presets.post_prompt(name))
             self._pending_nb = {"id": data.get("notebook_id"), "title": data.get("notebook_title")}
             if self.notebooks:
                 self._apply_pending_notebook()
@@ -847,15 +936,23 @@ class NotebookLMApp(ctk.CTk):
             self.lbl_diff.configure(text="Подключитесь и выберите блокнот, чтобы сравнить с папкой.",
                                     text_color=COLORS["text_secondary"])
             return
-        self._diff = eng.folder_diff(self._folder_files, self._sources_current)
-        new, orphans = len(self._diff["new"]), len(self._diff["orphans"])
-        if not new and not orphans:
-            self.lbl_diff.configure(text="✓ Блокнот совпадает с папкой.", text_color=COLORS["success"])
-        else:
-            self.lbl_diff.configure(
-                text=f"Отличия: +{new} новых файлов в папке · −{orphans} лишних источников в блокноте. "
-                     f"Источники изменятся после «Синхронизировать» или Reload.",
-                text_color=COLORS["warning"])
+        d = self._diff = eng.folder_diff(self._folder_files, self._sources_current, self.presets.index_pattern)
+        stale = f"\nСтарые версии индекса в папке пропускаются: {len(d['stale_index'])}." if d["stale_index"] else ""
+        if not d["upload"] and not d["delete"]:
+            self.lbl_diff.configure(text="✓ Блокнот совпадает с папкой, индекс самый свежий." + stale,
+                                    text_color=COLORS["success"])
+            return
+        parts = []
+        if d["new"]:
+            parts.append(f"+{len(d['new'])} новых")
+        if d["changed"]:
+            parts.append(f"~{len(d['changed'])} изменённых")
+        if d["index_upload"]:
+            parts.append("★ индекс → " + ", ".join(f.name for f in d["index_upload"]))
+        if d["delete"]:
+            parts.append(f"−{len(d['delete'])} к удалению")
+        self.lbl_diff.configure(text="Отличия: " + " · ".join(parts) + ". Применятся по «Синхронизировать»." + stale,
+                                text_color=COLORS["warning"])
 
     # ------------------------------------------------------------ Jobs -----
     def _require_notebook(self) -> bool:
@@ -965,6 +1062,18 @@ class NotebookLMApp(ctk.CTk):
             else:
                 text = f"✓ Готово: удалено {result['deleted']}, загружено {result['uploaded']}, ошибок {errors}"
                 color = COLORS["warning"] if errors else COLORS["success"]
+                if result.get("index"):
+                    text += " · индекс: " + ", ".join(result["index"])
+            qa = result.get("qa")
+            if qa:
+                self._chat_append(f"\n🔄 После синхронизации · {job['label']} → {job['nb_title']}\n"
+                                  f"🧑 {qa['question']}\n🤖 NotebookLM:\n{qa['answer']}\n")
+                text += " · ответ в чате 💬"
+                if qa.get("pending"):
+                    text += f" (ещё обрабатывалось: {qa['pending']})"
+            elif result.get("qa_error"):
+                text += " · вопрос в чат не удался"
+                self._log(f"[CHAT] {job['label']}: {result['qa_error']}")
         else:
             ok, errors = result
             text = f"✓ Готово: успешно {ok}, ошибок {errors}"
@@ -1112,20 +1221,46 @@ class NotebookLMApp(ctk.CTk):
             return False
         return True
 
+    def _sync_job(self, mode: str, files: list[Path], ask: tuple[bool, str], resolve):
+        """Job factory for sync/reload; *resolve* is an async callable returning (client, nb_id, nb_title)."""
+        conc, pattern = self.presets.concurrency, self.presets.index_pattern
+        op = eng.reload if mode == "reload" else eng.sync_delta
+        enabled, prompt = ask
+
+        async def _run(on_event):
+            client, nb_id, nb_title = await resolve()
+            res = await op(client, nb_id, files, conc, on_event, pattern)
+            if enabled:
+                try:
+                    res["qa"] = await eng.ask_after_sync(client, nb_id, nb_title, prompt, res, on_event)
+                except Exception as exc:
+                    res["qa_error"] = str(exc)
+            return res
+        return _run
+
+    def _current_resolver(self):
+        client, nb_id, title = self.client, self.selected_nb_id, self._selected_nb_title()
+
+        async def _resolve():
+            return client, nb_id, title
+        return _resolve
+
     def _reload_folder(self):
         """Delete every source in the notebook, then upload the whole folder."""
         if not self._folder_job_ready():
             return
         files, title = list(self._folder_files), self._selected_nb_title()
+        regular, latest, _ = eng.split_index_files(files, self.presets.index_pattern)
         if not messagebox.askyesno(
             "Reload",
             f"Блокнот «{title}»: сначала будут УДАЛЕНЫ все источники ({len(self._sources_current)}),\n"
-            f"затем загружено {len(files)} файлов из папки.\nЭто необратимо. Продолжить?",
+            f"затем загружено {len(regular) + len(latest)} файлов из папки (только свежий индекс).\n"
+            f"Это необратимо. Продолжить?",
         ):
             return
-        client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
-        self._start_job("Reload", self._active_preset() or "—", nb_id, title,
-                        lambda ev: eng.reload(client, nb_id, files, conc, ev))
+        self._start_job("Reload", self._active_preset() or "—", self.selected_nb_id, title,
+                        self._sync_job("reload", files, (bool(self.var_ask.get()), self._prompt_text()),
+                                       self._current_resolver()))
 
     def _sync_folder(self):
         """Upload only new files and delete sources whose file is gone."""
@@ -1133,17 +1268,17 @@ class NotebookLMApp(ctk.CTk):
             return
         files, title = list(self._folder_files), self._selected_nb_title()
         if self._diff is not None:
-            new, orphans = len(self._diff["new"]), len(self._diff["orphans"])
-            if not new and not orphans:
-                messagebox.showinfo("Синхронизация", "Блокнот уже совпадает с папкой.")
+            up, dl = len(self._diff["upload"]), len(self._diff["delete"])
+            if not up and not dl:
+                messagebox.showinfo("Синхронизация", "Блокнот уже совпадает с папкой, индекс самый свежий.")
                 return
-            if orphans and not messagebox.askyesno(
-                    "Синхронизация", f"Будет загружено {new} новых файлов и удалено {orphans} лишних источников. "
-                                     f"Продолжить?"):
+            if dl and not messagebox.askyesno(
+                    "Синхронизация", f"Будет загружено {up} файлов и удалено {dl} источников "
+                                     f"(устаревшие, изменённые и старые версии индекса). Продолжить?"):
                 return
-        client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
-        self._start_job("Синхронизация", self._active_preset() or "—", nb_id, title,
-                        lambda ev: eng.sync_delta(client, nb_id, files, conc, ev))
+        self._start_job("Синхронизация", self._active_preset() or "—", self.selected_nb_id, title,
+                        self._sync_job("sync", files, (bool(self.var_ask.get()), self._prompt_text()),
+                                       self._current_resolver()))
 
     def _open_multi_dialog(self):
         candidates = [n for n in self.presets.names()
@@ -1210,19 +1345,17 @@ class NotebookLMApp(ctk.CTk):
             return
         storage = data.get("storage_path") or ""
         ref_id, ref_title = data.get("notebook_id") or "", data.get("notebook_title") or ""
-        conc = self.presets.concurrency
-        op = eng.reload if mode == "reload" else eng.sync_delta
 
-        async def _run(on_event):
+        async def _resolve():
             client, nbs = await self._client_for(storage)
             nb = (eng.resolve_notebook(nbs, ref_id) if ref_id else None) or \
                 (eng.resolve_notebook(nbs, ref_title) if ref_title else None)
             if not nb:
                 raise RuntimeError(f"Блокнот не найден: {ref_title or ref_id}")
-            return await op(client, nb.id, files, conc, on_event)
+            return client, nb.id, nb.title
 
         self._start_job("Reload" if mode == "reload" else "Синхронизация", name, ref_id or None,
-                        ref_title or ref_id, _run)
+                        ref_title or ref_id, self._sync_job(mode, files, self.presets.post_prompt(name), _resolve))
 
     # ---------------------------------------------------- Chat -------------
     def _send_query(self):
