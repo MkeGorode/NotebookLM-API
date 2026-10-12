@@ -317,7 +317,7 @@ class NotebookLMApp(ctk.CTk):
         side = self._panel(body)
         side.grid(row=0, column=0, sticky="nsew")
         side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(6, weight=1)
+        side.grid_rowconfigure(7, weight=1)
         pad = {"padx": 14}
 
         # Template
@@ -340,9 +340,22 @@ class NotebookLMApp(ctk.CTk):
         self.btn_refresh_nb = self._btn(nrow, "⟳", self._refresh_notebooks, "secondary", 34)
         self.btn_refresh_nb.grid(row=0, column=1)
 
+        # Source folder
+        self._section(side, "Папка-источник").grid(row=4, column=0, pady=(16, 4), sticky="ew", **pad)
+        frow = ctk.CTkFrame(side, fg_color="transparent")
+        frow.grid(row=5, column=0, sticky="ew", **pad)
+        frow.grid_columnconfigure(0, weight=1)
+        self.btn_side_folder = self._btn(frow, "📁  Выбрать папку…", self._choose_folder_upload, "secondary", 120)
+        self.btn_side_folder.configure(anchor="w")
+        self.btn_side_folder.grid(row=0, column=0, sticky="ew")
+        self.lbl_side_diff = ctk.CTkLabel(frow, text="", font=self._font(11), anchor="w", justify="left",
+                                          text_color=COLORS["text_secondary"], cursor="hand2")
+        self.lbl_side_diff.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.lbl_side_diff.bind("<Button-1>", lambda _e: self.tabs.set(TAB_SYNC))
+
         # Sources
         shead = ctk.CTkFrame(side, fg_color="transparent")
-        shead.grid(row=4, column=0, pady=(16, 4), sticky="ew", **pad)
+        shead.grid(row=6, column=0, pady=(12, 4), sticky="ew", **pad)
         shead.grid_columnconfigure(0, weight=1)
         self.lbl_sources = self._section(shead, "Источники")
         self.lbl_sources.grid(row=0, column=0, sticky="w")
@@ -350,11 +363,11 @@ class NotebookLMApp(ctk.CTk):
 
         self.sources_list = ctk.CTkScrollableFrame(side, fg_color=COLORS["background"], corner_radius=6,
                                                    border_width=1, border_color=COLORS["border"])
-        self.sources_list.grid(row=6, column=0, sticky="nsew", **pad)
+        self.sources_list.grid(row=7, column=0, sticky="nsew", **pad)
         self.sources_list.grid_columnconfigure(0, weight=1)
 
         add = ctk.CTkFrame(side, fg_color="transparent")
-        add.grid(row=7, column=0, pady=(10, 14), sticky="ew", **pad)
+        add.grid(row=8, column=0, pady=(10, 14), sticky="ew", **pad)
         add.grid_columnconfigure(0, weight=1)
         self.url_entry = self._entry(add, "Вставьте ссылку и нажмите Enter")
         self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -402,7 +415,8 @@ class NotebookLMApp(ctk.CTk):
             row=0, column=2, rowspan=2, padx=14, pady=(12, 0))
         self.lbl_diff = ctk.CTkLabel(folder, text="", font=self._font(12, "bold"), anchor="w", justify="left",
                                      wraplength=640, text_color=COLORS["text_secondary"])
-        self.lbl_diff.grid(row=2, column=0, columnspan=3, padx=14, pady=(6, 12), sticky="ew")
+        self.lbl_diff.grid(row=2, column=0, columnspan=2, padx=(14, 0), pady=(6, 12), sticky="ew")
+        self._btn(folder, "Подробнее", self._show_plan, "ghost", 100, 26).grid(row=2, column=2, padx=14, pady=(6, 12))
 
         actions = ctk.CTkFrame(tab, fg_color="transparent")
         actions.grid(row=3, column=0, padx=10, pady=(12, 0), sticky="ew")
@@ -902,12 +916,16 @@ class NotebookLMApp(ctk.CTk):
     def _set_folder(self, folder: Path):
         self._folder_to_upload = folder
         self._folder_files = eng.folder_files(folder)
+        short = folder.name if len(folder.name) <= 26 else folder.name[:25] + "…"
         if not folder.exists():
             self.lbl_folder.configure(text=folder.name, text_color=COLORS["danger"])
             self.lbl_folder_info.configure(text=f"Папка не найдена: {folder}")
+            self.btn_side_folder.configure(text=f"⚠  {short} — не найдена", text_color=COLORS["danger"])
         else:
             self.lbl_folder.configure(text=folder.name, text_color=COLORS["text"])
             self.lbl_folder_info.configure(text=f"{folder}  ·  {len(self._folder_files)} поддерживаемых файлов")
+            self.btn_side_folder.configure(text=f"📁  {short} · {len(self._folder_files)} файлов",
+                                           text_color=COLORS["text"])
         self._update_diff()
 
     def _clear_folder(self):
@@ -915,17 +933,51 @@ class NotebookLMApp(ctk.CTk):
         self._folder_files = []
         self.lbl_folder.configure(text="Папка не выбрана", text_color=COLORS["text"])
         self.lbl_folder_info.configure(text="—")
+        self.btn_side_folder.configure(text="📁  Выбрать папку…", text_color=COLORS["text"])
         self._update_diff()
 
     def _choose_folder_upload(self):
-        folder = filedialog.askdirectory(title="Выберите папку-источник для блокнота")
-        if folder:
-            self._set_folder(Path(folder))
-            self._autosave(folder=str(self._folder_to_upload))
+        start = self._folder_to_upload if self._folder_to_upload and self._folder_to_upload.exists() else None
+        options = {"initialdir": str(start)} if start else {}
+        folder = filedialog.askdirectory(
+            parent=self, mustexist=True, **options,
+            title="Папка-источник: откройте нужную папку и нажмите «Выбор папки» (файлы здесь не показываются)")
+        if not folder:
+            return
+        self._set_folder(Path(folder))
+        self._autosave(folder=str(self._folder_to_upload))
+        self._log(f"[FOLDER] {self._folder_to_upload} · {len(self._folder_files)} файлов")
+        self.tabs.set(TAB_SYNC)
+
+    def _show_plan(self):
+        """Write the exact sync plan (what will be uploaded / deleted) to the Журнал tab."""
+        d = self._diff
+        if d is None:
+            messagebox.showinfo("Синхронизация", "Подключитесь, выберите блокнот и папку — тогда план будет готов.")
+            return
+        self._log(f"[PLAN] {self._selected_nb_title()} ← {self._folder_to_upload}: "
+                  f"загрузить {len(d['upload'])}, удалить {len(d['delete'])}, без изменений остальные")
+        for f in d["new"]:
+            self._log(f"  + новый: {f.name}")
+        for f in d["changed"]:
+            self._log(f"  ~ изменён после загрузки (заменится): {f.name}")
+        for f in d["index_upload"]:
+            self._log(f"  ★ свежий индекс: {f.name}")
+        changed = {f.name.lower() for f in d["changed"]}
+        index_del = {sid for sid, _ in d["index_delete"]}
+        for sid, title in d["delete"]:
+            why = ("старая версия индекса" if sid in index_del else
+                   "заменится новой версией" if title.strip().lower() in changed else
+                   "файла нет в папке / ошибка обработки")
+            self._log(f"  − удалить ({why}): {title}")
+        for f in d["stale_index"]:
+            self._log(f"  · пропущен (старый индекс в папке): {f.name}")
+        self.tabs.set(TAB_LOG)
 
     def _update_diff(self):
         """Show how the chosen folder differs from the notebook (nothing is changed until Reload/Sync)."""
         self._diff = None
+        self.lbl_side_diff.configure(text="", text_color=COLORS["text_secondary"])
         if not self._folder_to_upload:
             self.lbl_diff.configure(text="", text_color=COLORS["text_secondary"])
             return
@@ -941,7 +993,10 @@ class NotebookLMApp(ctk.CTk):
         if not d["upload"] and not d["delete"]:
             self.lbl_diff.configure(text="✓ Блокнот совпадает с папкой, индекс самый свежий." + stale,
                                     text_color=COLORS["success"])
+            self.lbl_side_diff.configure(text="✓ совпадает с блокнотом", text_color=COLORS["success"])
             return
+        self.lbl_side_diff.configure(text=f"к синхронизации: +{len(d['upload'])} / −{len(d['delete'])}  →",
+                                     text_color=COLORS["warning"])
         parts = []
         if d["new"]:
             parts.append(f"+{len(d['new'])} новых")
