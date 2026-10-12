@@ -4,7 +4,7 @@ Full-featured GUI for Google NotebookLM via notebooklm-py.
 """
 
 import asyncio
-import json
+import concurrent.futures
 import queue
 import re
 import threading
@@ -16,12 +16,9 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+import sync_engine as eng
 from core_notebooklm import NotebookLMSync
-
-_SUPPORTED_UPLOAD_EXTS = {
-    ".pdf", ".txt", ".md", ".docx", ".csv",
-    ".png", ".jpg", ".jpeg", ".mp3", ".mp4", ".wav",
-}
+from sync_engine import PresetStore
 
 # Fluent Design palette shared with the AI Expert Indexer
 COLORS = {
@@ -47,6 +44,9 @@ TAB_CHAT, TAB_SYNC, TAB_LOG, TAB_SETTINGS = "💬 Чат", "🔄 Синхрон�
 NOT_CONNECTED = "Сначала подключитесь"
 NO_PRESETS = "— нет шаблонов —"
 SEND_TEXT = "Отправить ➤"
+PRESET_FIELD_NAMES = {"folder": "папка", "notebook_id": "блокнот", "notebook_title": "блокнот",
+                      "storage_path": "storage"}
+PHASE_NAMES = {"delete": "Удаление", "upload": "Загрузка"}
 
 
 def _kind_icon(kind: str) -> str:
@@ -56,44 +56,6 @@ def _kind_icon(kind: str) -> str:
         if key in k:
             return icon
     return "📄"
-PRESETS_FILE = Path(__file__).with_name("presets.json")
-
-
-class PresetStore:
-    """Named templates: folder + notebook + settings, persisted as JSON."""
-
-    def __init__(self, path: Path = PRESETS_FILE):
-        self.path = path
-        self.presets: dict[str, dict] = {}
-        self.last: str | None = None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            self.presets = dict(data.get("presets", {}))
-            self.last = data.get("last")
-        except (OSError, ValueError):
-            pass
-
-    def _save(self):
-        payload = {"presets": self.presets, "last": self.last}
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def names(self) -> list[str]:
-        return sorted(self.presets, key=str.lower)
-
-    def put(self, name: str, data: dict):
-        self.presets[name] = data
-        self.last = name
-        self._save()
-
-    def remove(self, name: str):
-        self.presets.pop(name, None)
-        if self.last == name:
-            self.last = None
-        self._save()
-
-    def touch(self, name: str):
-        self.last = name
-        self._save()
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +92,7 @@ def run_async(coro, on_success=None, on_error=None):
 
     def _poll(root: ctk.CTk):
         if future.done():
-            exc = future.exception()
+            exc = concurrent.futures.CancelledError() if future.cancelled() else future.exception()
             if exc:
                 if on_error:
                     on_error(exc)
@@ -167,12 +129,26 @@ class NotebookLMApp(ctk.CTk):
         self._folder_to_upload: Path | None = None
         self._selected_source_id: str | None = None
         self._source_rows: dict = {}
+        self._sources_placeholder = None
+        self._sources_current: list = []
+        self._sources_nb: str | None = None
+        self._folder_files: list[Path] = []
+        self._diff: dict | None = None
         self.presets = PresetStore()
         self._pending_nb: dict | None = None
+        self._applying_preset = False
+        self._connected_key: str | None = None
+        self._clients: dict[str, tuple] = {}
+        self._client_locks: dict = {}
+        self.jobs: dict[int, dict] = {}
+        self._busy_nbs: set[str] = set()
+        self._job_seq = 0
+        self._jobs_placeholder = None
 
         self._ui_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._build_ui()
         self._drain_ui()
+        self.storage_entry.bind("<FocusOut>", lambda _e: self._autosave(storage_path=self.storage_entry.get().strip()))
         self._restore_last_preset()
 
     def _ui(self, fn):
@@ -319,7 +295,7 @@ class NotebookLMApp(ctk.CTk):
         prow.grid_columnconfigure(0, weight=1)
         self.cb_presets = self._combo(prow, self.presets.names() or [NO_PRESETS], self._apply_preset)
         self.cb_presets.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self._btn(prow, "💾", self._save_preset, "secondary", 34).grid(row=0, column=1, padx=(0, 4))
+        self._btn(prow, "＋", self._new_preset, "secondary", 34).grid(row=0, column=1, padx=(0, 4))
         self._btn(prow, "✖", self._delete_preset, "secondary", 34).grid(row=0, column=2)
 
         # Notebook
@@ -327,7 +303,7 @@ class NotebookLMApp(ctk.CTk):
         nrow = ctk.CTkFrame(side, fg_color="transparent")
         nrow.grid(row=3, column=0, sticky="ew", **pad)
         nrow.grid_columnconfigure(0, weight=1)
-        self.cb_notebooks = self._combo(nrow, [NOT_CONNECTED], self._on_notebook_selected)
+        self.cb_notebooks = self._combo(nrow, [NOT_CONNECTED], self._on_notebook_user_selected)
         self.cb_notebooks.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.btn_refresh_nb = self._btn(nrow, "⟳", self._refresh_notebooks, "secondary", 34)
         self.btn_refresh_nb.grid(row=0, column=1)
@@ -377,44 +353,52 @@ class NotebookLMApp(ctk.CTk):
 
     def _build_sync_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(5, weight=1)
         self._title(tab, "Синхронизация папки с блокнотом").grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
-        self._hint(tab, "Выберите локальную папку — её файлы станут источниками выбранного блокнота. "
-                        "Папка сохраняется в шаблоне.").grid(row=1, column=0, padx=10, pady=(0, 12), sticky="w")
+        self._hint(tab, "Папка и блокнот запоминаются в активном шаблоне. Выбор папки ничего не меняет в блокноте — "
+                        "ниже видно, чем они отличаются.", 700).grid(row=1, column=0, padx=10, pady=(0, 10), sticky="w")
 
         folder = self._panel(tab, fg_color=COLORS["background"])
         folder.grid(row=2, column=0, padx=10, sticky="ew")
         folder.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(folder, text="📁", font=ctk.CTkFont(size=22)).grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=12)
+        ctk.CTkLabel(folder, text="📁", font=ctk.CTkFont(size=22)).grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=(12, 0))
         self.lbl_folder = self._label(folder, "Папка не выбрана", size=13)
         self.lbl_folder.grid(row=0, column=1, sticky="ew", pady=(12, 0))
-        self.lbl_folder_info = self._hint(folder, "—")
-        self.lbl_folder_info.grid(row=1, column=1, sticky="ew", pady=(0, 12))
+        self.lbl_folder_info = self._hint(folder, "—", 560)
+        self.lbl_folder_info.grid(row=1, column=1, sticky="ew")
         self._btn(folder, "Выбрать…", self._choose_folder_upload, "secondary", 110).grid(
-            row=0, column=2, rowspan=2, padx=14)
+            row=0, column=2, rowspan=2, padx=14, pady=(12, 0))
+        self.lbl_diff = ctk.CTkLabel(folder, text="", font=self._font(12, "bold"), anchor="w", justify="left",
+                                     wraplength=640, text_color=COLORS["text_secondary"])
+        self.lbl_diff.grid(row=2, column=0, columnspan=3, padx=14, pady=(6, 12), sticky="ew")
 
         actions = ctk.CTkFrame(tab, fg_color="transparent")
-        actions.grid(row=3, column=0, padx=10, pady=(16, 0), sticky="ew")
+        actions.grid(row=3, column=0, padx=10, pady=(12, 0), sticky="ew")
         actions.grid_columnconfigure(1, weight=1)
+        rows = (
+            ("⇄  Синхронизировать", self._sync_folder, "primary",
+             "Быстро: загружает только новые файлы и удаляет источники, файлов которых больше нет."),
+            ("♻  Reload", self._reload_folder, "secondary",
+             "Полностью: удаляет ВСЕ источники и загружает папку заново."),
+            ("▶  Несколько шаблонов…", self._open_multi_dialog, "secondary",
+             "Запустить синхронизацию или Reload сразу для нескольких шаблонов параллельно."),
+        )
+        for i, (text, cmd, kind, hint) in enumerate(rows):
+            btn = self._btn(actions, text, cmd, kind, 200, 36)
+            btn.grid(row=i, column=0, pady=(0, 8), sticky="w")
+            self._hint(actions, hint, 460).grid(row=i, column=1, padx=14, pady=(0, 8), sticky="w")
+        self.btn_reload = actions.grid_slaves(row=1, column=0)[0]
 
-        self.btn_reload = self._btn(actions, "♻  Reload", self._reload_folder, "primary", 190, 40)
-        self.btn_reload.grid(row=0, column=0, pady=(0, 10), sticky="w")
-        self._hint(actions, "Рекомендуется. Удаляет ВСЕ источники блокнота и загружает файлы папки заново — "
-                            "блокнот точно совпадёт с папкой.", 420).grid(row=0, column=1, padx=14, pady=(0, 10), sticky="w")
+        jhead = ctk.CTkFrame(tab, fg_color="transparent")
+        jhead.grid(row=4, column=0, padx=10, pady=(8, 4), sticky="ew")
+        jhead.grid_columnconfigure(0, weight=1)
+        self._section(jhead, "Задачи").grid(row=0, column=0, sticky="w")
+        self._btn(jhead, "Удалить все источники…", self._delete_all_sources, "ghost", 170, 24).grid(row=0, column=1)
 
-        self.btn_reupload = self._btn(actions, "⬆  Только добавить", self._reupload_folder, "secondary", 190, 40)
-        self.btn_reupload.grid(row=1, column=0, sticky="w")
-        self._hint(actions, "Добавляет файлы папки к существующим источникам без удаления. "
-                            "Возможны дубликаты.", 420).grid(row=1, column=1, padx=14, sticky="w")
-
-        danger = self._panel(tab, fg_color=COLORS["danger_bg"], border_color=COLORS["danger_border"])
-        danger.grid(row=4, column=0, padx=10, pady=(24, 10), sticky="ew")
-        danger.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(danger, text="Опасная зона", text_color=COLORS["danger"], font=self._font(12, "bold"),
-                     anchor="w").grid(row=0, column=0, padx=14, pady=(10, 0), sticky="w")
-        self._hint(danger, "Удалить все источники блокнота без загрузки новых. Действие необратимо.", 420).grid(
-            row=1, column=0, padx=14, pady=(0, 10), sticky="w")
-        self._btn(danger, "Удалить все источники", self._delete_all_sources, "danger", 190).grid(
-            row=0, column=1, rowspan=2, padx=14)
+        self.jobs_list = ctk.CTkScrollableFrame(tab, fg_color=COLORS["surface"], corner_radius=6,
+                                                border_width=1, border_color=COLORS["border"])
+        self.jobs_list.grid(row=5, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        self._show_jobs_placeholder()
 
     def _build_log_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
@@ -452,6 +436,23 @@ class NotebookLMApp(ctk.CTk):
         )):
             self._btn(dbg, text, cmd, "secondary", 210).grid(row=i // 2, column=i % 2, padx=(0, 8), pady=(0, 8), sticky="w")
 
+        ctk.CTkFrame(tab, fg_color=COLORS["border"], height=1).grid(row=6, column=0, padx=10, pady=20, sticky="ew")
+        self._title(tab, "Производительность").grid(row=7, column=0, padx=10, pady=(0, 2), sticky="w")
+        self._hint(tab, "Сколько файлов загружать/удалять одновременно внутри одной задачи. Больше — быстрее, "
+                        "но выше риск ограничений Google. Разные задачи и так идут параллельно.").grid(
+            row=8, column=0, padx=10, pady=(0, 8), sticky="w")
+        conc = ctk.CTkFrame(tab, fg_color="transparent")
+        conc.grid(row=9, column=0, padx=10, sticky="w")
+        self._label(conc, "Параллельных операций:").pack(side="left", padx=(0, 8))
+        self.cb_concurrency = self._combo(conc, ["1", "2", "4", "6", "8", "12"], self._on_concurrency)
+        self.cb_concurrency.configure(width=80)
+        self.cb_concurrency.set(str(self.presets.concurrency))
+        self.cb_concurrency.pack(side="left")
+
+    def _on_concurrency(self, value: str):
+        self.presets.concurrency = int(value)
+        self._log(f"[SETTINGS] Параллельных операций: {value}")
+
     def _build_statusbar(self):
         bar = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=30)
         bar.grid(row=2, column=0, sticky="ew")
@@ -471,43 +472,6 @@ class NotebookLMApp(ctk.CTk):
         color = {"ok": COLORS["success"], "busy": COLORS["warning"], "error": COLORS["danger"]}.get(
             kind, COLORS["text_secondary"])
         self.lbl_auth_status.configure(text=f"● {text}", text_color=color)
-
-    def _render_sources(self, sources: list, placeholder: str | None = None):
-        for w in self.sources_list.winfo_children():
-            w.destroy()
-        self._source_rows = {}
-        if placeholder or not sources:
-            self.lbl_sources.configure(text="ИСТОЧНИКИ")
-            self._hint(self.sources_list, placeholder or "В блокноте нет источников", 260).grid(
-                row=0, column=0, padx=8, pady=10, sticky="w")
-            return
-        self.lbl_sources.configure(text=f"ИСТОЧНИКИ · {len(sources)}")
-        for i, src in enumerate(sources):
-            sid = self._source_id_of(src)
-            if not sid:
-                continue
-            title = self._source_title_of(src)
-            row = ctk.CTkFrame(self.sources_list, fg_color="transparent", corner_radius=4, height=30)
-            row.grid(row=i, column=0, sticky="ew", pady=1)
-            row.grid_columnconfigure(0, weight=1)
-            short = title if len(title) <= 34 else title[:33] + "…"
-            lbl = ctk.CTkLabel(row, text=f"{_kind_icon(self._source_kind_of(src))}  {short}", anchor="w",
-                               text_color=COLORS["text"], font=self._font(12), cursor="hand2")
-            lbl.grid(row=0, column=0, padx=(6, 0), sticky="ew")
-            delete = ctk.CTkButton(row, text="✕", width=24, height=24, corner_radius=4, fg_color="transparent",
-                                   hover_color=COLORS["danger_bg"], text_color=COLORS["text_secondary"],
-                                   font=self._font(12), command=lambda s=sid, t=title: self._delete_source(s, t))
-            delete.grid(row=0, column=1, padx=(2, 4))
-            for w in (row, lbl):
-                w.bind("<Button-1>", lambda _e, s=sid: self._select_source(s))
-            self._source_rows[sid] = row
-        if self._selected_source_id in self._source_rows:
-            self._select_source(self._selected_source_id)
-
-    def _select_source(self, sid: str):
-        self._selected_source_id = sid
-        for key, row in self._source_rows.items():
-            row.configure(fg_color=COLORS["selected"] if key == sid else "transparent")
 
     # -------------------------------------------------------- Chat helpers --
     def _chat_append(self, text: str, tag: str = ""):
@@ -560,6 +524,7 @@ class NotebookLMApp(ctk.CTk):
         def _ok(result):
             client, nbs = result
             self.client = client
+            self._connected_key = path or ""
             self.notebooks = nbs
             self._populate_notebooks(nbs)
             self._set_status(f"Подключено · {len(nbs)} блокнотов", "ok")
@@ -609,6 +574,10 @@ class NotebookLMApp(ctk.CTk):
         self.cb_presets.configure(values=names or [NO_PRESETS])
         self.cb_presets.set(select if select in names else (names[0] if names else NO_PRESETS))
 
+    def _active_preset(self) -> str | None:
+        name = self.cb_presets.get()
+        return name if name in self.presets.presets else None
+
     def _current_preset_data(self) -> dict:
         nb = next((n for n in self.notebooks if n.id == self.selected_nb_id), None)
         return {
@@ -618,44 +587,63 @@ class NotebookLMApp(ctk.CTk):
             "notebook_title": getattr(nb, "title", "") if nb else "",
         }
 
-    def _save_preset(self):
-        current = self.cb_presets.get()
-        default = current if current in self.presets.presets else ""
-        dialog = ctk.CTkInputDialog(text="Название шаблона (существующее будет перезаписано):",
-                                    title="Сохранить шаблон")
+    def _autosave(self, **fields):
+        """Write user changes (folder / notebook / storage) into the active template."""
+        name = self._active_preset()
+        if not name or self._applying_preset:
+            return
+        data = self.presets.get(name) or {}
+        changed = {k: v for k, v in fields.items() if data.get(k) != v}
+        if not changed:
+            return
+        self.presets.update(name, **changed)
+        what = ", ".join(dict.fromkeys(PRESET_FIELD_NAMES[k] for k in changed if k in PRESET_FIELD_NAMES))
+        self._log(f"[PRESET] «{name}» сохранён: {what}")
+
+    def _new_preset(self):
+        dialog = ctk.CTkInputDialog(
+            text="Название нового шаблона.\nВ него запишутся текущие папка, блокнот и путь storage.",
+            title="Новый шаблон")
         name = (dialog.get_input() or "").strip()
         if not name:
             return
-        if name in self.presets.presets and name != default and not messagebox.askyesno(
-                "Шаблон", f"Шаблон «{name}» уже есть. Перезаписать?"):
+        if name in self.presets.presets and not messagebox.askyesno(
+                "Шаблон", f"Шаблон «{name}» уже есть. Перезаписать текущими настройками?"):
             return
         self.presets.put(name, self._current_preset_data())
         self._refresh_presets_combo(name)
-        self._log(f"[PRESET] Сохранён: {name}")
+        self._log(f"[PRESET] Создан: {name}")
 
     def _apply_preset(self, name: str | None = None):
         name = name or self.cb_presets.get()
-        data = self.presets.presets.get(name)
+        data = self.presets.get(name)
         if not data:
-            messagebox.showwarning("Шаблон", "Выберите сохранённый шаблон.")
             return
-        if data.get("storage_path"):
-            self.storage_entry.delete(0, "end")
-            self.storage_entry.insert(0, data["storage_path"])
-        elif self.storage_entry.get():
-            self.storage_entry.delete(0, "end")
-            self.storage_entry._activate_placeholder()
+        self._applying_preset = True
+        try:
+            if data.get("storage_path"):
+                self.storage_entry.delete(0, "end")
+                self.storage_entry.insert(0, data["storage_path"])
+            elif self.storage_entry.get():
+                self.storage_entry.delete(0, "end")
+                self.storage_entry._activate_placeholder()
 
-        folder = data.get("folder")
-        if folder:
-            self._set_folder(Path(folder))
+            if data.get("folder"):
+                self._set_folder(Path(data["folder"]))
+            else:
+                self._clear_folder()
 
-        self._pending_nb = {"id": data.get("notebook_id"), "title": data.get("notebook_title")}
-        if self.notebooks:
-            self._apply_pending_notebook()
+            self._pending_nb = {"id": data.get("notebook_id"), "title": data.get("notebook_title")}
+            if self.notebooks:
+                self._apply_pending_notebook()
+        finally:
+            self._applying_preset = False
         self.presets.touch(name)
         self.cb_presets.set(name)
         self._log(f"[PRESET] Применён: {name}")
+        if self.client and (data.get("storage_path") or "") != self._connected_key:
+            self._log("[PRESET] Другой аккаунт (storage) — переподключаюсь…")
+            self._test_connection()
 
     def _apply_pending_notebook(self):
         pend, self._pending_nb = self._pending_nb, None
@@ -669,10 +657,10 @@ class NotebookLMApp(ctk.CTk):
         self._log(f"[PRESET] Блокнот «{pend.get('title') or pend.get('id')}» не найден.")
 
     def _delete_preset(self):
-        name = self.cb_presets.get()
-        if name not in self.presets.presets:
+        name = self._active_preset()
+        if not name:
             return
-        if messagebox.askyesno("Шаблон", f"Удалить шаблон «{name}»?"):
+        if messagebox.askyesno("Шаблон", f"Удалить шаблон «{name}»?\nПапка и блокнот не затрагиваются."):
             self.presets.remove(name)
             self._refresh_presets_combo()
 
@@ -707,33 +695,41 @@ class NotebookLMApp(ctk.CTk):
             self._log(f"[SYSTEM] Выбран блокнот: {self.notebooks[idx].title}")
             self._refresh_sources_combo()
 
+    def _on_notebook_user_selected(self, choice: str):
+        self._on_notebook_selected(choice)
+        nb = next((n for n in self.notebooks if n.id == self.selected_nb_id), None)
+        if nb:
+            self._autosave(notebook_id=nb.id, notebook_title=nb.title)
+
     def _source_id_of(self, src) -> str | None:
-        for attr in ("id", "source_id", "uuid"):
-            val = getattr(src, attr, None)
-            if val:
-                return str(val)
-        return None
+        return eng.source_id(src)
 
     def _source_title_of(self, src) -> str:
-        return str(getattr(src, "title", "—"))
+        return eng.source_title(src)
 
     def _source_kind_of(self, src) -> str:
         return str(getattr(src, "kind", "?"))
 
     def _populate_sources(self, sources: list):
-        self._render_sources(list(sources))
+        self._sources_current = list(sources)
+        self._sources_nb = self.selected_nb_id
+        self._render_sources(self._sources_current)
+        self._update_diff()
 
     def _refresh_sources_combo(self):
         if not self.client or not self.selected_nb_id:
             self._selected_source_id = None
+            self._sources_nb = None
             self._render_sources([], NOT_CONNECTED)
+            self._update_diff()
             return
 
         nb_id = self.selected_nb_id
+        client = self.client
         self._render_sources([], "Загрузка…")
 
         async def _fetch():
-            return await self.client.sources.list(nb_id)
+            return await client.sources.list(nb_id)
 
         def _ok(sources):
             if nb_id != self.selected_nb_id:
@@ -758,21 +754,110 @@ class NotebookLMApp(ctk.CTk):
 
         self._schedule(_fetch(), on_success=_ok)
 
-    # ---------------------------------------------------- Sources ----------
-    def _set_progress(self, current: int, total: int, prefix: str = "Прогресс"):
-        if total <= 0:
-            pct = 0
-            value = 0.0
+    # ------------------------------------------------------ Sources list ---
+    def _render_sources(self, sources: list, placeholder: str | None = None):
+        for w in self.sources_list.winfo_children():
+            w.destroy()
+        self._source_rows = {}
+        self._sources_placeholder = None
+        if placeholder or not sources:
+            self.lbl_sources.configure(text="ИСТОЧНИКИ")
+            self._sources_placeholder = self._hint(self.sources_list, placeholder or "В блокноте нет источников", 260)
+            self._sources_placeholder.pack(anchor="w", padx=8, pady=10)
+            return
+        for src in sources:
+            self._add_source_row(src)
+        if self._selected_source_id in self._source_rows:
+            self._select_source(self._selected_source_id)
+
+    def _add_source_row(self, src):
+        sid = eng.source_id(src)
+        if not sid or sid in self._source_rows:
+            return
+        if self._sources_placeholder is not None:
+            self._sources_placeholder.destroy()
+            self._sources_placeholder = None
+        title = eng.source_title(src)
+        row = ctk.CTkFrame(self.sources_list, fg_color="transparent", corner_radius=4, height=30)
+        row.pack(fill="x", pady=1)
+        row.grid_columnconfigure(0, weight=1)
+        short = title if len(title) <= 34 else title[:33] + "…"
+        lbl = ctk.CTkLabel(row, text=f"{_kind_icon(self._source_kind_of(src))}  {short}", anchor="w",
+                           text_color=COLORS["text"], font=self._font(12), cursor="hand2")
+        lbl.grid(row=0, column=0, padx=(6, 0), sticky="ew")
+        delete = ctk.CTkButton(row, text="✕", width=24, height=24, corner_radius=4, fg_color="transparent",
+                               hover_color=COLORS["danger_bg"], text_color=COLORS["text_secondary"],
+                               font=self._font(12), command=lambda s=sid, t=title: self._delete_source(s, t))
+        delete.grid(row=0, column=1, padx=(2, 4))
+        for w in (row, lbl):
+            w.bind("<Button-1>", lambda _e, s=sid: self._select_source(s))
+        self._source_rows[sid] = row
+        self._update_sources_count()
+
+    def _remove_source_row(self, sid: str):
+        row = self._source_rows.pop(sid, None)
+        if row is not None:
+            row.destroy()
+        self._sources_current = [s for s in self._sources_current if eng.source_id(s) != sid]
+        self._update_sources_count()
+
+    def _update_sources_count(self):
+        self.lbl_sources.configure(text=f"ИСТОЧНИКИ · {len(self._source_rows)}")
+
+    def _select_source(self, sid: str):
+        self._selected_source_id = sid
+        for key, row in self._source_rows.items():
+            row.configure(fg_color=COLORS["selected"] if key == sid else "transparent")
+
+    # ---------------------------------------------------- Folder & diff ----
+    def _set_folder(self, folder: Path):
+        self._folder_to_upload = folder
+        self._folder_files = eng.folder_files(folder)
+        if not folder.exists():
+            self.lbl_folder.configure(text=folder.name, text_color=COLORS["danger"])
+            self.lbl_folder_info.configure(text=f"Папка не найдена: {folder}")
         else:
-            value = max(0.0, min(current / total, 1.0))
-            pct = round(value * 100)
-        self.pb_op.set(value)
-        self.lbl_op_progress.configure(text=f"{prefix}: {pct}% ({current}/{total})")
+            self.lbl_folder.configure(text=folder.name, text_color=COLORS["text"])
+            self.lbl_folder_info.configure(text=f"{folder}  ·  {len(self._folder_files)} поддерживаемых файлов")
+        self._update_diff()
 
-    def _reset_progress(self):
-        self.pb_op.set(0)
-        self.lbl_op_progress.configure(text="")
+    def _clear_folder(self):
+        self._folder_to_upload = None
+        self._folder_files = []
+        self.lbl_folder.configure(text="Папка не выбрана", text_color=COLORS["text"])
+        self.lbl_folder_info.configure(text="—")
+        self._update_diff()
 
+    def _choose_folder_upload(self):
+        folder = filedialog.askdirectory(title="Выберите папку-источник для блокнота")
+        if folder:
+            self._set_folder(Path(folder))
+            self._autosave(folder=str(self._folder_to_upload))
+
+    def _update_diff(self):
+        """Show how the chosen folder differs from the notebook (nothing is changed until Reload/Sync)."""
+        self._diff = None
+        if not self._folder_to_upload:
+            self.lbl_diff.configure(text="", text_color=COLORS["text_secondary"])
+            return
+        if not self._folder_files:
+            self.lbl_diff.configure(text="В папке нет поддерживаемых файлов.", text_color=COLORS["warning"])
+            return
+        if not self.selected_nb_id or self._sources_nb != self.selected_nb_id:
+            self.lbl_diff.configure(text="Подключитесь и выберите блокнот, чтобы сравнить с папкой.",
+                                    text_color=COLORS["text_secondary"])
+            return
+        self._diff = eng.folder_diff(self._folder_files, self._sources_current)
+        new, orphans = len(self._diff["new"]), len(self._diff["orphans"])
+        if not new and not orphans:
+            self.lbl_diff.configure(text="✓ Блокнот совпадает с папкой.", text_color=COLORS["success"])
+        else:
+            self.lbl_diff.configure(
+                text=f"Отличия: +{new} новых файлов в папке · −{orphans} лишних источников в блокноте. "
+                     f"Источники изменятся после «Синхронизировать» или Reload.",
+                text_color=COLORS["warning"])
+
+    # ------------------------------------------------------------ Jobs -----
     def _require_notebook(self) -> bool:
         if not self.client:
             messagebox.showwarning("Нет подключения", "Сначала нажмите «Подключиться».")
@@ -782,6 +867,157 @@ class NotebookLMApp(ctk.CTk):
             return False
         return True
 
+    def _selected_nb_title(self) -> str:
+        nb = next((n for n in self.notebooks if n.id == self.selected_nb_id), None)
+        return nb.title if nb else (self.selected_nb_id or "—")
+
+    async def _client_for(self, storage: str):
+        """Connection for a template's account; reuses the current one when the storage path matches."""
+        key = storage or ""
+        if self.client and key == self._connected_key:
+            return self.client, self.notebooks
+        lock = self._client_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._clients:
+                self._clients[key] = await eng.connect(key or None)
+        return self._clients[key]
+
+    def _show_jobs_placeholder(self):
+        self._jobs_placeholder = self._hint(self.jobs_list, "Нет задач. Reload и синхронизация разных "
+                                                            "шаблонов могут идти одновременно.", 520)
+        self._jobs_placeholder.pack(anchor="w", padx=8, pady=8)
+
+    def _start_job(self, kind: str, label: str, nb_id: str | None, nb_title: str, make_coro):
+        """Run make_coro(on_event) as an independent background job with its own progress row."""
+        if nb_id and nb_id in self._busy_nbs:
+            messagebox.showwarning("Занято", f"Для блокнота «{nb_title}» уже выполняется задача.")
+            return None
+        self._job_seq += 1
+        jid = self._job_seq
+        if self._jobs_placeholder is not None:
+            self._jobs_placeholder.destroy()
+            self._jobs_placeholder = None
+
+        row = self._panel(self.jobs_list, fg_color=COLORS["background"])
+        row.pack(fill="x", padx=2, pady=3)
+        row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(row, text=f"{kind} · {label} → {nb_title}", text_color=COLORS["text"],
+                     font=self._font(12, "bold"), anchor="w").grid(row=0, column=0, padx=10, pady=(6, 0), sticky="ew")
+        status = self._hint(row, "Подготовка…", 480)
+        status.grid(row=1, column=0, padx=10, sticky="ew")
+        bar = ctk.CTkProgressBar(row, height=6, progress_color=COLORS["primary"], fg_color=COLORS["border"])
+        bar.grid(row=2, column=0, columnspan=2, padx=10, pady=(2, 8), sticky="ew")
+        bar.set(0)
+        btn = self._btn(row, "Отмена", lambda: self._cancel_job(jid), "secondary", 80, 26)
+        btn.grid(row=0, column=1, rowspan=2, padx=8, pady=(6, 0))
+
+        job = {"id": jid, "kind": kind, "label": label, "nb_id": nb_id, "nb_title": nb_title,
+               "state": "running", "done": 0, "total": 0, "errors": 0,
+               "row": row, "status": status, "bar": bar, "btn": btn, "future": None}
+        self.jobs[jid] = job
+        if nb_id:
+            self._busy_nbs.add(nb_id)
+
+        def on_event(ev, **d):
+            self._ui(lambda: self._job_event(jid, ev, d))
+
+        future, poll = run_async(make_coro(on_event),
+                                 on_success=lambda r: self._ui(lambda: self._job_done(jid, r)),
+                                 on_error=lambda e: self._ui(lambda: self._job_failed(jid, e)))
+        job["future"] = future
+        self.after(100, poll, self)
+        self._log(f"[JOB] Старт: {kind} · {label} → {nb_title}")
+        self._update_global_progress()
+        return jid
+
+    def _job_event(self, jid: int, ev: str, d: dict):
+        job = self.jobs.get(jid)
+        if not job or job["state"] != "running":
+            return
+        if ev == "progress":
+            job.update(done=d["done"], total=d["total"])
+            job["bar"].set(d["done"] / d["total"] if d["total"] else 1)
+            job["status"].configure(text=f"{PHASE_NAMES.get(d['phase'], d['phase'])}: {d['done']} из {d['total']}"
+                                         + (f" · ошибок {job['errors']}" if job["errors"] else ""))
+            self._update_global_progress()
+        elif ev == "deleted":
+            if job["nb_id"] == self.selected_nb_id:
+                self._remove_source_row(d["sid"])
+            self._log(f"  🗑 [{job['label']}] {d['title']}")
+        elif ev == "uploaded":
+            src = d.get("source")
+            if src is not None and job["nb_id"] == self.selected_nb_id and self._sources_nb == job["nb_id"]:
+                self._sources_current.append(src)
+                self._add_source_row(src)
+            self._log(f"  ☁ [{job['label']}] {d['name']}")
+        elif ev == "error":
+            job["errors"] += 1
+            self._log(f"  ❌ [{job['label']}] {d['title']}: {d['error']}")
+
+    def _job_done(self, jid: int, result):
+        job = self.jobs.get(jid)
+        if not job or job["state"] != "running":
+            return
+        if isinstance(result, dict):
+            errors = result["delete_errors"] + result["upload_errors"]
+            if result["aborted"]:
+                text, color = "⚠ Прервано: не все источники удалены, загрузка не выполнялась.", COLORS["danger"]
+            else:
+                text = f"✓ Готово: удалено {result['deleted']}, загружено {result['uploaded']}, ошибок {errors}"
+                color = COLORS["warning"] if errors else COLORS["success"]
+        else:
+            ok, errors = result
+            text = f"✓ Готово: успешно {ok}, ошибок {errors}"
+            color = COLORS["warning"] if errors else COLORS["success"]
+        self._finish_job(job, text, color)
+
+    def _job_failed(self, jid: int, exc: BaseException):
+        job = self.jobs.get(jid)
+        if not job or job["state"] != "running":
+            return
+        if isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError)):
+            self._finish_job(job, "Отменено пользователем.", COLORS["text_secondary"])
+        else:
+            self._finish_job(job, f"❌ {exc}", COLORS["danger"])
+
+    def _finish_job(self, job: dict, text: str, color: str):
+        job["state"] = "done"
+        job["status"].configure(text=text, text_color=color)
+        job["bar"].configure(progress_color=color)
+        job["bar"].set(1)
+        job["btn"].configure(text="Скрыть", command=lambda: self._hide_job(job["id"]))
+        if job["nb_id"]:
+            self._busy_nbs.discard(job["nb_id"])
+        self._log(f"[JOB] {job['kind']} · {job['label']}: {text}")
+        self._update_global_progress()
+        if job["nb_id"] == self.selected_nb_id:
+            self._refresh_sources_combo()
+
+    def _cancel_job(self, jid: int):
+        job = self.jobs.get(jid)
+        if job and job["state"] == "running" and job["future"]:
+            job["status"].configure(text="Отмена…")
+            job["future"].cancel()
+
+    def _hide_job(self, jid: int):
+        job = self.jobs.pop(jid, None)
+        if job:
+            job["row"].destroy()
+        if not self.jobs:
+            self._show_jobs_placeholder()
+
+    def _update_global_progress(self):
+        running = [j for j in self.jobs.values() if j["state"] == "running"]
+        if not running:
+            self.pb_op.set(0)
+            self.lbl_op_progress.configure(text="")
+            return
+        done = sum(j["done"] for j in running)
+        total = sum(j["total"] for j in running)
+        self.pb_op.set(done / total if total else 0)
+        self.lbl_op_progress.configure(text=f"Задач: {len(running)} · {done}/{total}")
+
+    # ----------------------------------------------------- Job launchers ---
     def _add_files(self):
         if not self._require_notebook():
             return
@@ -798,267 +1034,195 @@ class NotebookLMApp(ctk.CTk):
         if not paths:
             return
         files = [Path(p) for p in paths]
-        nb_id = self.selected_nb_id
-        self._log(f"[UPLOAD] Загрузка {len(files)} файл(ов)…")
-
-        def _ok(result):
-            uploaded, errors = result
-            self._log(f"[UPLOAD] Готово: загружено {uploaded}, ошибок {errors}")
-            self._refresh_sources_combo()
-
-        self._schedule(self._upload_all_coro(nb_id, files, "Загрузка"), on_success=_ok)
+        client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
+        self._start_job("Загрузка файлов", f"{len(files)} шт.", nb_id, self._selected_nb_title(),
+                        lambda ev: eng.upload_many(client, nb_id, files, conc, ev))
 
     def _add_url_source(self):
-        if not self.client:
-            messagebox.showwarning("Нет подключения", "Сначала подключитесь.")
-            return
-        if not self.selected_nb_id:
-            messagebox.showwarning("Блокнот", "Выберите блокнот.")
+        if not self._require_notebook():
             return
         url = self.url_entry.get().strip()
         if not url:
             return
-        nb_id = self.selected_nb_id
+        nb_id, client = self.selected_nb_id, self.client
 
         async def _add():
-            return await self.client.sources.add_url(nb_id, url)
+            return await client.sources.add_url(nb_id, url)
 
         def _ok(src):
             title = getattr(src, "title", url)
             self._log(f"[SOURCE] URL добавлен: {title}")
             self.url_entry.delete(0, "end")
-            self._refresh_sources_combo()
+            if nb_id == self.selected_nb_id:
+                self._refresh_sources_combo()
 
         self._log(f"[URL] Добавление {url}…")
         self._schedule(_add(), on_success=_ok)
 
     def _list_sources(self):
-        if not self.client or not self.selected_nb_id:
-            messagebox.showwarning("Нет данных", "Подключитесь и выберите блокнот.")
+        if not self._require_notebook():
             return
-
-        nb_id = self.selected_nb_id
+        nb_id, client = self.selected_nb_id, self.client
 
         async def _fetch():
-            return await self.client.sources.list(nb_id)
+            return await client.sources.list(nb_id)
 
         def _ok(sources):
-            self._populate_sources(sources)
-            if not sources:
-                self._log("[SOURCES] Источников нет.")
-                return
             self._log(f"[SOURCES] Источники ({len(sources)}):")
             for i, src in enumerate(sources, 1):
-                kind = getattr(src, "kind", "?")
-                title = getattr(src, "title", "—")
-                self._log(f"  {i}. [{kind}] {title}")
+                self._log(f"  {i}. [{self._source_kind_of(src)}] {eng.source_title(src)}")
 
         self._schedule(_fetch(), on_success=_ok)
-
-    async def _delete_source_api(self, notebook_id: str, source_id: str):
-        """Try supported delete/remove signatures from notebooklm-py versions."""
-        mgr = self.client.sources
-        variants = [
-            ("delete", (notebook_id, source_id)),
-            ("delete", (source_id,)),
-            ("remove", (notebook_id, source_id)),
-            ("remove", (source_id,)),
-        ]
-
-        for method_name, args in variants:
-            fn = getattr(mgr, method_name, None)
-            if not fn:
-                continue
-            try:
-                result = fn(*args)
-                if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
-                    return await result
-                return result
-            except TypeError:
-                continue
-
-        raise RuntimeError(
-            "NotebookLM API does not expose sources.delete/remove in this version."
-        )
 
     def _delete_source(self, src_id: str, title: str):
         if not self._require_notebook():
             return
         if not messagebox.askyesno("Удалить источник", f"Удалить «{title}» из блокнота?"):
             return
-        nb_id = self.selected_nb_id
+        nb_id, client = self.selected_nb_id, self.client
 
         def _ok(_):
             self._log(f"[DELETE] Удалён: {title}")
             if self._selected_source_id == src_id:
                 self._selected_source_id = None
-            self._refresh_sources_combo()
+            if nb_id == self.selected_nb_id:
+                self._remove_source_row(src_id)
+                self._update_diff()
 
-        self._schedule(self._delete_source_api(nb_id, src_id), on_success=_ok)
+        self._schedule(eng.delete_source(client, nb_id, src_id), on_success=_ok)
 
     def _delete_all_sources(self):
-        if not self.client or not self.selected_nb_id:
-            messagebox.showwarning("Нет подключения", "Сначала подключитесь и выберите блокнот.")
+        if not self._require_notebook():
             return
-
-        if not messagebox.askyesno(
-            "ОПАСНО",
-            "Удалить ВСЕ источники в выбранном блокноте?\nЭто действие необратимо.",
-        ):
+        title = self._selected_nb_title()
+        if not messagebox.askyesno("ОПАСНО", f"Удалить ВСЕ источники в блокноте «{title}»?\nЭто необратимо."):
             return
+        client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
+        self._start_job("Удаление всех", self._active_preset() or "—", nb_id, title,
+                        lambda ev: eng.wipe_all(client, nb_id, conc, ev))
 
-        nb_id = self.selected_nb_id
-
-        def _ok(result):
-            deleted, errors = result
-            self._log(f"[DELETE ALL] Готово: удалено {deleted}, ошибок {errors}")
-            self._set_progress(deleted + errors, max(deleted + errors, 1), "Delete all")
-            self._refresh_sources_combo()
-
-        self._schedule(self._wipe_all_coro(nb_id), on_success=_ok)
-
-    async def _wipe_all_coro(self, nb_id: str, prefix: str = "Delete all"):
-        sources = await self.client.sources.list(nb_id)
-        total = len(sources)
-        deleted = 0
-        errors = 0
-        self._ui(lambda: self._set_progress(0, total, prefix))
-        for src in sources:
-            sid = self._source_id_of(src)
-            title = self._source_title_of(src)
-            if not sid:
-                errors += 1
-            else:
-                try:
-                    await self._delete_source_api(nb_id, sid)
-                    deleted += 1
-                    self._ui(lambda t=title: self._log(f"  🗑 {t}"))
-                except Exception as e:
-                    errors += 1
-                    self._ui(lambda t=title, err=str(e): self._log(f"  ❌ {t}: {err}"))
-            done = deleted + errors
-            self._ui(lambda d=done, t=total: self._set_progress(d, t, prefix))
-        return deleted, errors
-
-    async def _upload_all_coro(self, nb_id: str, files: list[Path], prefix: str = "Reupload"):
-        total = len(files)
-        uploaded = 0
-        errors = 0
-        self._ui(lambda: self._set_progress(0, total, prefix))
-        for i, fpath in enumerate(files, 1):
-            try:
-                await self.client.sources.add_file(nb_id, fpath)
-                uploaded += 1
-                self._ui(lambda n=fpath.name, a=i, t=total: self._log(f"  ☁️ [{a}/{t}] {n}"))
-            except Exception as e:
-                errors += 1
-                self._ui(lambda n=fpath.name, err=str(e): self._log(f"  ❌ {n}: {err}"))
-            done = uploaded + errors
-            self._ui(lambda d=done, t=total: self._set_progress(d, t, prefix))
-        return uploaded, errors
-
-    def _set_folder(self, folder: Path):
-        self._folder_to_upload = folder
-        if not folder.exists():
-            self.lbl_folder.configure(text=folder.name, text_color=COLORS["danger"])
-            self.lbl_folder_info.configure(text=f"Папка не найдена: {folder}")
-            return
-        count = sum(1 for f in folder.rglob("*") if f.is_file() and not f.name.startswith(".")
-                    and f.suffix.lower() in _SUPPORTED_UPLOAD_EXTS)
-        self.lbl_folder.configure(text=folder.name, text_color=COLORS["text"])
-        self.lbl_folder_info.configure(text=f"{folder}  ·  {count} поддерживаемых файлов")
-
-    def _choose_folder_upload(self):
-        folder = filedialog.askdirectory(title="Выберите папку для полной перезагрузки")
-        if folder:
-            self._set_folder(Path(folder))
-
-    def _collect_folder_files(self) -> list[Path] | None:
-        """Validate connection/notebook/folder and return files to upload, or None."""
-        if not self.client:
-            messagebox.showwarning("Нет подключения", "Сначала подключитесь.")
-            return None
-        if not self.selected_nb_id:
-            messagebox.showwarning("Блокнот", "Выберите блокнот.")
-            return None
+    def _folder_job_ready(self) -> bool:
+        if not self._require_notebook():
+            return False
         if not self._folder_to_upload or not self._folder_to_upload.exists():
-            messagebox.showwarning("Папка", "Сначала выберите папку для загрузки.")
-            return None
-
-        files = [
-            f for f in sorted(self._folder_to_upload.rglob('*'))
-            if f.is_file() and not f.name.startswith('.') and f.suffix.lower() in _SUPPORTED_UPLOAD_EXTS
-        ]
-        if not files:
-            messagebox.showwarning("Папка", "Подходящие файлы не найдены.")
-            return None
-        return files
+            messagebox.showwarning("Папка", "Сначала выберите папку.")
+            return False
+        if not self._folder_files:
+            messagebox.showwarning("Папка", "В папке нет поддерживаемых файлов.")
+            return False
+        return True
 
     def _reload_folder(self):
         """Delete every source in the notebook, then upload the whole folder."""
-        files = self._collect_folder_files()
-        if files is None:
+        if not self._folder_job_ready():
             return
-
+        files, title = list(self._folder_files), self._selected_nb_title()
         if not messagebox.askyesno(
             "Reload",
-            f"Сначала будут УДАЛЕНЫ все источники выбранного блокнота,\n"
+            f"Блокнот «{title}»: сначала будут УДАЛЕНЫ все источники ({len(self._sources_current)}),\n"
             f"затем загружено {len(files)} файлов из папки.\nЭто необратимо. Продолжить?",
         ):
             return
+        client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
+        self._start_job("Reload", self._active_preset() or "—", nb_id, title,
+                        lambda ev: eng.reload(client, nb_id, files, conc, ev))
 
-        nb_id = self.selected_nb_id
-        self.btn_reload.configure(state="disabled")
-        self._log(f"[RELOAD] Старт: удаление всех источников → загрузка {len(files)} файлов")
+    def _sync_folder(self):
+        """Upload only new files and delete sources whose file is gone."""
+        if not self._folder_job_ready():
+            return
+        files, title = list(self._folder_files), self._selected_nb_title()
+        if self._diff is not None:
+            new, orphans = len(self._diff["new"]), len(self._diff["orphans"])
+            if not new and not orphans:
+                messagebox.showinfo("Синхронизация", "Блокнот уже совпадает с папкой.")
+                return
+            if orphans and not messagebox.askyesno(
+                    "Синхронизация", f"Будет загружено {new} новых файлов и удалено {orphans} лишних источников. "
+                                     f"Продолжить?"):
+                return
+        client, nb_id, conc = self.client, self.selected_nb_id, self.presets.concurrency
+        self._start_job("Синхронизация", self._active_preset() or "—", nb_id, title,
+                        lambda ev: eng.sync_delta(client, nb_id, files, conc, ev))
 
-        async def _reload():
-            deleted, del_err = await self._wipe_all_coro(nb_id, "Reload: delete")
-            self._ui(lambda: self._log(f"[RELOAD] Удалено {deleted}, ошибок {del_err}. Загрузка…"))
-            if del_err:
-                return deleted, 0, 0, True
-            uploaded, up_err = await self._upload_all_coro(nb_id, files, "Reload: upload")
-            return deleted, uploaded, up_err, False
-
-        def _done():
-            self.btn_reload.configure(state="normal")
-            self._refresh_sources_combo()
-
-        def _ok(result):
-            deleted, uploaded, up_err, aborted = result
-            if aborted:
-                self._log("[RELOAD] ⚠ Прервано: часть источников не удалена, загрузка не выполнялась.")
-            else:
-                self._log(f"[RELOAD] Готово: удалено {deleted}, загружено {uploaded}, ошибок {up_err}")
-            _done()
-
-        def _err(exc):
-            self._log(f"[RELOAD] ❌ {exc}")
-            _done()
-            messagebox.showerror("Reload", str(exc))
-
-        self._schedule(_reload(), on_success=_ok, on_error=_err)
-
-    def _reupload_folder(self):
-        files = self._collect_folder_files()
-        if files is None:
+    def _open_multi_dialog(self):
+        candidates = [n for n in self.presets.names()
+                      if (p := self.presets.get(n)).get("folder") and (p.get("notebook_id") or p.get("notebook_title"))]
+        if not candidates:
+            messagebox.showinfo("Несколько шаблонов", "Нет шаблонов, в которых заданы и папка, и блокнот.")
             return
 
-        if not messagebox.askyesno(
-            "Reupload Folder",
-            f"Загрузить {len(files)} файлов в выбранный блокнот?",
-        ):
+        win = ctk.CTkToplevel(self)
+        win.title("Запуск по шаблонам")
+        win.geometry(f"620x{min(220 + 34 * len(candidates), 620)}")
+        win.configure(fg_color=COLORS["background"])
+        win.transient(self)
+        win.after(150, win.grab_set)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        self._title(win, "Выберите шаблоны — задачи пойдут параллельно").grid(
+            row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+        box = ctk.CTkScrollableFrame(win, fg_color=COLORS["surface"], corner_radius=6)
+        box.grid(row=1, column=0, padx=16, sticky="nsew")
+        checks = {}
+        for name in candidates:
+            p = self.presets.get(name)
+            var = ctk.BooleanVar(value=True)
+            folder = Path(p["folder"])
+            ctk.CTkCheckBox(box, text=f"{name}  —  {p.get('notebook_title') or p.get('notebook_id')}  ←  "
+                                      f"{folder.name} ({len(eng.folder_files(folder))} файлов)",
+                            variable=var, font=self._font(12), text_color=COLORS["text"],
+                            fg_color=COLORS["primary"], hover_color=COLORS["primary_hover"]).pack(
+                anchor="w", padx=8, pady=4)
+            checks[name] = var
+
+        mode = ctk.StringVar(value="sync")
+        modes = ctk.CTkFrame(win, fg_color="transparent")
+        modes.grid(row=2, column=0, padx=16, pady=10, sticky="w")
+        for value, text in (("sync", "Синхронизировать изменения"), ("reload", "Reload (удалить всё и загрузить)")):
+            ctk.CTkRadioButton(modes, text=text, value=value, variable=mode, font=self._font(12),
+                               text_color=COLORS["text"], fg_color=COLORS["primary"]).pack(side="left", padx=(0, 16))
+
+        def _start():
+            chosen = [n for n, v in checks.items() if v.get()]
+            if not chosen:
+                return
+            if mode.get() == "reload" and not messagebox.askyesno(
+                    "Reload", f"В {len(chosen)} блокнотах будут удалены ВСЕ источники и загружены заново. Продолжить?",
+                    parent=win):
+                return
+            win.destroy()
+            for n in chosen:
+                self._start_preset_job(n, mode.get())
+            self.tabs.set(TAB_SYNC)
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="e")
+        self._btn(btns, "Отмена", win.destroy, "secondary", 100).pack(side="left", padx=(0, 8))
+        self._btn(btns, "Запустить", _start, "primary", 120).pack(side="left")
+
+    def _start_preset_job(self, name: str, mode: str):
+        data = self.presets.get(name) or {}
+        files = eng.folder_files(data.get("folder"))
+        if not files:
+            self._log(f"[JOB] «{name}»: папка пуста или не найдена — пропущено.")
             return
+        storage = data.get("storage_path") or ""
+        ref_id, ref_title = data.get("notebook_id") or "", data.get("notebook_title") or ""
+        conc = self.presets.concurrency
+        op = eng.reload if mode == "reload" else eng.sync_delta
 
-        nb_id = self.selected_nb_id
-        self._log(f"[REUPLOAD] Старт: {len(files)} файлов из {self._folder_to_upload}")
+        async def _run(on_event):
+            client, nbs = await self._client_for(storage)
+            nb = (eng.resolve_notebook(nbs, ref_id) if ref_id else None) or \
+                (eng.resolve_notebook(nbs, ref_title) if ref_title else None)
+            if not nb:
+                raise RuntimeError(f"Блокнот не найден: {ref_title or ref_id}")
+            return await op(client, nb.id, files, conc, on_event)
 
-        def _ok(result):
-            uploaded, errors = result
-            self._log(f"[REUPLOAD] Готово: загружено {uploaded}, ошибок {errors}")
-            self._set_progress(uploaded + errors, max(uploaded + errors, 1), "Reupload")
-            self._refresh_sources_combo()
-
-        self._schedule(self._upload_all_coro(nb_id, files), on_success=_ok)
+        self._start_job("Reload" if mode == "reload" else "Синхронизация", name, ref_id or None,
+                        ref_title or ref_id, _run)
 
     # ---------------------------------------------------- Chat -------------
     def _send_query(self):
