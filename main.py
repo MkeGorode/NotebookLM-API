@@ -5,7 +5,10 @@ Full-featured GUI for Google NotebookLM via notebooklm-py.
 
 import asyncio
 import json
+import queue
+import re
 import threading
+from datetime import datetime
 import subprocess
 import sys
 from pathlib import Path
@@ -28,14 +31,31 @@ COLORS = {
     "success": "#107C10",
     "danger": "#D13438",
     "danger_hover": "#A4262C",
+    "danger_bg": "#FDE7E9",
+    "danger_border": "#F1BBBC",
     "warning": "#CA5010",
     "background": "#FFFFFF",
-    "surface": "#F3F3F3",
-    "border": "#E0E0E0",
+    "surface": "#F7F7F7",
+    "border": "#E1DFDD",
+    "selected": "#EFF6FC",
+    "selected_strong": "#C7E0F4",
     "text": "#323130",
     "text_secondary": "#605E5C",
 }
 FONT = "Segoe UI"
+TAB_CHAT, TAB_SYNC, TAB_LOG, TAB_SETTINGS = "💬 Чат", "🔄 Синхронизация", "📜 Журнал", "⚙ Настройки"
+NOT_CONNECTED = "Сначала подключитесь"
+NO_PRESETS = "— нет шаблонов —"
+SEND_TEXT = "Отправить ➤"
+
+
+def _kind_icon(kind: str) -> str:
+    k = kind.lower()
+    for key, icon in (("youtube", "▶"), ("web", "🔗"), ("url", "🔗"), ("pdf", "📕"), ("audio", "🎵"),
+                      ("image", "🖼"), ("video", "🎬"), ("drive", "☁"), ("text", "📝")):
+        if key in k:
+            return icon
+    return "📄"
 PRESETS_FILE = Path(__file__).with_name("presets.json")
 
 
@@ -135,8 +155,8 @@ class NotebookLMApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(self.APP_TITLE)
-        self.geometry("1060x820")
-        self.minsize(900, 700)
+        self.geometry("1180x780")
+        self.minsize(1000, 640)
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
         self.configure(fg_color=COLORS["background"])
@@ -144,198 +164,350 @@ class NotebookLMApp(ctk.CTk):
         self.client = None
         self.notebooks: list = []
         self.selected_nb_id: str | None = None
-        self._file_to_upload: Path | None = None
         self._folder_to_upload: Path | None = None
-        self._sources_cache: list = []
-        self._source_display_to_id: dict[str, str] = {}
         self._selected_source_id: str | None = None
+        self._source_rows: dict = {}
         self.presets = PresetStore()
         self._pending_nb: dict | None = None
 
+        self._ui_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._build_ui()
+        self._drain_ui()
         self._restore_last_preset()
+
+    def _ui(self, fn):
+        """Thread-safe: run *fn* on the Tk main thread."""
+        self._ui_queue.put(fn)
+
+    def _drain_ui(self):
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:  # keep the pump alive
+                print(f"UI callback error: {exc}", file=sys.stderr)
+        self.after(40, self._drain_ui)
 
     # ------------------------------------------------------------------ UI --
     # Widget factories keep the Fluent look consistent
-    def _card(self, row: int, **grid):
-        frame = ctk.CTkFrame(self, corner_radius=6, fg_color=COLORS["surface"],
-                             border_width=1, border_color=COLORS["border"])
-        frame.grid(row=row, column=0, padx=24, pady=grid.pop("pady", 6), sticky=grid.pop("sticky", "ew"))
-        return frame
+    def _font(self, size: int = 12, weight: str = "normal"):
+        return ctk.CTkFont(family=FONT, size=size, weight=weight)
 
-    def _title(self, parent, text: str):
-        return ctk.CTkLabel(parent, text=text, text_color=COLORS["primary"],
-                            font=ctk.CTkFont(family=FONT, size=13, weight="bold"))
+    def _panel(self, parent, **kw):
+        return ctk.CTkFrame(parent, corner_radius=8, fg_color=kw.pop("fg_color", COLORS["surface"]),
+                            border_width=1, border_color=kw.pop("border_color", COLORS["border"]), **kw)
+
+    def _section(self, parent, text: str):
+        return ctk.CTkLabel(parent, text=text.upper(), text_color=COLORS["text_secondary"],
+                            font=self._font(11, "bold"), anchor="w")
+
+    def _title(self, parent, text: str, size: int = 15):
+        return ctk.CTkLabel(parent, text=text, text_color=COLORS["text"], font=self._font(size, "bold"), anchor="w")
 
     def _label(self, parent, text: str, **kw):
         kw.setdefault("text_color", COLORS["text"])
-        return ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family=FONT, size=12), **kw)
+        kw.setdefault("anchor", "w")
+        return ctk.CTkLabel(parent, text=text, font=self._font(kw.pop("size", 12)), **kw)
+
+    def _hint(self, parent, text: str, wrap: int = 560):
+        return ctk.CTkLabel(parent, text=text, text_color=COLORS["text_secondary"], font=self._font(11),
+                            anchor="w", justify="left", wraplength=wrap)
 
     def _entry(self, parent, placeholder: str):
-        return ctk.CTkEntry(parent, placeholder_text=placeholder, fg_color=COLORS["background"],
-                            border_color=COLORS["border"], text_color=COLORS["text"],
-                            font=ctk.CTkFont(family=FONT, size=12))
+        return ctk.CTkEntry(parent, placeholder_text=placeholder, fg_color=COLORS["background"], height=32,
+                            border_color=COLORS["border"], text_color=COLORS["text"], font=self._font(12))
 
     def _combo(self, parent, values, command=None):
-        return ctk.CTkComboBox(parent, values=values, state="readonly", command=command,
+        return ctk.CTkComboBox(parent, values=values, state="readonly", command=command, height=32,
                                fg_color=COLORS["background"], border_color=COLORS["border"],
                                button_color=COLORS["primary"], button_hover_color=COLORS["primary_hover"],
-                               text_color=COLORS["text"], font=ctk.CTkFont(family=FONT, size=12))
+                               dropdown_fg_color=COLORS["background"], dropdown_text_color=COLORS["text"],
+                               dropdown_hover_color=COLORS["selected"],
+                               text_color=COLORS["text"], font=self._font(12), dropdown_font=self._font(12))
 
-    def _btn(self, parent, text: str, command, kind: str = "primary", width: int = 130):
+    def _btn(self, parent, text: str, command, kind: str = "primary", width: int = 130, height: int = 32):
         styles = {
             "primary": (COLORS["primary"], COLORS["primary_hover"], "white", None),
             "danger": (COLORS["danger"], COLORS["danger_hover"], "white", None),
-            "secondary": (COLORS["background"], COLORS["border"], COLORS["text"], COLORS["border"]),
+            "secondary": (COLORS["background"], COLORS["selected"], COLORS["text"], COLORS["border"]),
+            "ghost": ("transparent", COLORS["selected"], COLORS["text_secondary"], None),
         }
         fg, hover, txt, border = styles[kind]
-        return ctk.CTkButton(parent, text=text, width=width, command=command, corner_radius=4,
+        return ctk.CTkButton(parent, text=text, width=width, height=height, command=command, corner_radius=4,
                              fg_color=fg, hover_color=hover, text_color=txt,
-                             border_width=1 if border else 0, border_color=border or fg,
-                             font=ctk.CTkFont(family=FONT, size=12))
+                             border_width=1 if border else 0, border_color=border or COLORS["border"],
+                             font=self._font(12, "bold" if kind in ("primary", "danger") else "normal"))
+
+    def _textbox(self, parent):
+        return ctk.CTkTextbox(parent, wrap="word", state="disabled", corner_radius=6,
+                              fg_color=COLORS["background"], text_color=COLORS["text"],
+                              border_width=1, border_color=COLORS["border"], font=self._font(13))
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)  # chat area stretches
+        self.grid_rowconfigure(1, weight=1)
+        self._build_header()
 
-        # === 0. HEADER ===
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, padx=24, pady=(16, 6), sticky="ew")
-        ctk.CTkLabel(header, text="📓", font=ctk.CTkFont(size=32), text_color=COLORS["primary"]).pack(side="left", padx=(0, 14))
-        title_block = ctk.CTkFrame(header, fg_color="transparent")
-        title_block.pack(side="left")
-        ctk.CTkLabel(title_block, text="NotebookLM Desktop Client", text_color=COLORS["text"],
-                     font=ctk.CTkFont(family=FONT, size=18, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(title_block, text="BY MIKE GORODETSKYY", text_color=COLORS["primary"],
-                     font=ctk.CTkFont(family=FONT, size=10, weight="bold")).pack(anchor="w")
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=1, column=0, padx=20, pady=(12, 8), sticky="nsew")
+        body.grid_columnconfigure(0, minsize=330)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
-        # === 1. AUTH FRAME ===
-        auth_frame = self._card(1)
-        auth_frame.grid_columnconfigure(1, weight=1)
+        self._build_sidebar(body)
 
-        self._title(auth_frame, "🔑 Авторизация").grid(row=0, column=0, columnspan=4, padx=14, pady=(10, 4), sticky="w")
-
-        self._label(auth_frame, "Storage path:").grid(row=1, column=0, padx=(14, 4), pady=4, sticky="w")
-        self.storage_entry = self._entry(auth_frame, "~/.notebooklm/storage_state.json (по умолчанию)")
-        self.storage_entry.grid(row=1, column=1, padx=4, pady=4, sticky="ew")
-
-        self.btn_browser_login = self._btn(auth_frame, "🌐 Browser Login", self._browser_login, "secondary", 140)
-        self.btn_browser_login.grid(row=1, column=2, padx=4, pady=4)
-
-        self.btn_test_conn = self._btn(auth_frame, "✅ Test Connection", self._test_connection, "primary", 140)
-        self.btn_test_conn.grid(row=1, column=3, padx=(4, 14), pady=4)
-
-        self.lbl_auth_status = self._label(auth_frame, "Статус: не подключено", text_color=COLORS["text_secondary"])
-        self.lbl_auth_status.grid(row=2, column=0, columnspan=4, padx=14, pady=(0, 6), sticky="w")
-
-        # -- Presets row --
-        preset_row = ctk.CTkFrame(auth_frame, fg_color="transparent")
-        preset_row.grid(row=3, column=0, columnspan=4, padx=14, pady=(0, 10), sticky="ew")
-        preset_row.grid_columnconfigure(1, weight=1)
-        self._title(preset_row, "📌 Шаблон:").grid(row=0, column=0, padx=(0, 8), sticky="w")
-        self.cb_presets = self._combo(preset_row, self.presets.names() or ["-- нет шаблонов --"])
-        self.cb_presets.grid(row=0, column=1, padx=4, sticky="ew")
-        self._btn(preset_row, "▶ Применить", self._apply_preset, "primary", 110).grid(row=0, column=2, padx=4)
-        self._btn(preset_row, "💾 Сохранить", self._save_preset, "secondary", 110).grid(row=0, column=3, padx=4)
-        self._btn(preset_row, "✖ Удалить", self._delete_preset, "secondary", 100).grid(row=0, column=4, padx=(4, 0))
-
-        # === 2. NOTEBOOKS + SOURCES ===
-        mid_frame = self._card(2)
-        mid_frame.grid_columnconfigure(1, weight=1)
-
-        # -- Notebooks row --
-        self._title(mid_frame, "📓 Блокнот:").grid(row=0, column=0, padx=(14, 4), pady=(10, 4), sticky="w")
-        self.cb_notebooks = self._combo(mid_frame, ["-- сначала подключитесь --"], self._on_notebook_selected)
-        self.cb_notebooks.grid(row=0, column=1, padx=4, pady=(10, 4), sticky="ew")
-
-        self.btn_refresh_nb = self._btn(mid_frame, "🔄 Refresh Notebooks", self._refresh_notebooks, "secondary", 160)
-        self.btn_refresh_nb.grid(row=0, column=2, padx=(4, 14), pady=(10, 4))
-
-        # -- Sources row --
-        self._title(mid_frame, "📎 Источник:").grid(row=1, column=0, padx=(14, 4), pady=4, sticky="w")
-        self.lbl_file = self._label(mid_frame, "файл не выбран", text_color=COLORS["text_secondary"])
-        self.lbl_file.grid(row=1, column=1, padx=4, pady=4, sticky="w")
-
-        src_btns = ctk.CTkFrame(mid_frame, fg_color="transparent")
-        src_btns.grid(row=1, column=2, padx=(4, 14), pady=4, sticky="e")
-        self._btn(src_btns, "📂 Выбрать файл", self._choose_file, "secondary", 120).pack(side="left", padx=(0, 6))
-        self._btn(src_btns, "⬆ Загрузить", self._upload_source, "primary", 120).pack(side="left")
-
-        # -- URL source row --
-        self._label(mid_frame, "🔗 URL:").grid(row=2, column=0, padx=(14, 4), pady=(4, 8), sticky="w")
-        self.url_entry = self._entry(mid_frame, "https://example.com (Enter для добавления)")
-        self.url_entry.grid(row=2, column=1, padx=4, pady=(4, 8), sticky="ew")
-        self.url_entry.bind("<Return>", lambda _: self._add_url_source())
-        self._btn(mid_frame, "➕ Добавить URL", self._add_url_source, "primary", 160).grid(
-            row=2, column=2, padx=(4, 14), pady=(4, 8)
+        self.tabs = ctk.CTkTabview(
+            body, corner_radius=8, fg_color=COLORS["surface"], border_width=1, border_color=COLORS["border"],
+            segmented_button_fg_color=COLORS["border"],
+            segmented_button_selected_color=COLORS["selected_strong"],
+            segmented_button_selected_hover_color=COLORS["selected_strong"],
+            segmented_button_unselected_color=COLORS["surface"],
+            segmented_button_unselected_hover_color=COLORS["selected"],
+            text_color=COLORS["text"], anchor="w",
         )
+        self.tabs.grid(row=0, column=1, padx=(12, 0), sticky="nsew")
+        self.tabs._segmented_button.configure(font=self._font(12, "bold"), height=32)
+        for name in (TAB_CHAT, TAB_SYNC, TAB_LOG, TAB_SETTINGS):
+            self.tabs.add(name)
+        self._build_chat_tab(self.tabs.tab(TAB_CHAT))
+        self._build_sync_tab(self.tabs.tab(TAB_SYNC))
+        self._build_log_tab(self.tabs.tab(TAB_LOG))
+        self._build_settings_tab(self.tabs.tab(TAB_SETTINGS))
+        self.tabs.set(TAB_CHAT)
 
-        # -- Manage existing sources row --
-        self._title(mid_frame, "🗑 Source:").grid(row=3, column=0, padx=(14, 4), pady=(4, 8), sticky="w")
-        self.cb_sources = self._combo(mid_frame, ["-- выберите блокнот --"], self._on_source_selected)
-        self.cb_sources.grid(row=3, column=1, padx=4, pady=(4, 8), sticky="ew")
+        self._build_statusbar()
 
-        src_manage_btns = ctk.CTkFrame(mid_frame, fg_color="transparent")
-        src_manage_btns.grid(row=3, column=2, padx=(4, 14), pady=(4, 8), sticky="e")
-        self._btn(src_manage_btns, "🔄", self._refresh_sources_combo, "secondary", 44).pack(side="left", padx=(0, 6))
-        self._btn(src_manage_btns, "🗑 Удалить", self._delete_selected_source, "secondary", 110).pack(side="left", padx=(0, 6))
-        self._btn(src_manage_btns, "☢ Удалить ВСЕ", self._delete_all_sources, "danger", 130).pack(side="left")
+    def _build_header(self):
+        header = ctk.CTkFrame(self, fg_color=COLORS["background"], corner_radius=0, height=64)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(1, weight=1)
+        ctk.CTkFrame(header, fg_color=COLORS["border"], height=1, corner_radius=0).grid(
+            row=1, column=0, columnspan=3, sticky="ew")
 
-        # -- Bulk reupload / reload row --
-        self._title(mid_frame, "📁 Reload:").grid(row=4, column=0, padx=(14, 4), pady=(0, 10), sticky="w")
-        self.lbl_folder = self._label(mid_frame, "папка не выбрана", text_color=COLORS["text_secondary"])
-        self.lbl_folder.grid(row=4, column=1, padx=4, pady=(0, 10), sticky="w")
+        brand = ctk.CTkFrame(header, fg_color="transparent")
+        brand.grid(row=0, column=0, padx=20, pady=10, sticky="w")
+        ctk.CTkLabel(brand, text="📓", font=ctk.CTkFont(size=26)).pack(side="left", padx=(0, 10))
+        names = ctk.CTkFrame(brand, fg_color="transparent")
+        names.pack(side="left")
+        ctk.CTkLabel(names, text="NotebookLM Desktop Client", text_color=COLORS["text"],
+                     font=self._font(17, "bold"), height=22).pack(anchor="w")
+        ctk.CTkLabel(names, text="BY MIKE GORODETSKYY", text_color=COLORS["primary"],
+                     font=self._font(9, "bold"), height=14).pack(anchor="w")
 
-        folder_btns = ctk.CTkFrame(mid_frame, fg_color="transparent")
-        folder_btns.grid(row=4, column=2, padx=(4, 14), pady=(0, 10), sticky="e")
-        self._btn(folder_btns, "📂 Выбрать папку", self._choose_folder_upload, "secondary", 120).pack(side="left", padx=(0, 6))
-        self._btn(folder_btns, "⬆ Загрузить папку", self._reupload_folder, "secondary", 140).pack(side="left", padx=(0, 6))
-        self.btn_reload = self._btn(folder_btns, "♻ Reload", self._reload_folder, "primary", 110)
-        self.btn_reload.pack(side="left")
+        right = ctk.CTkFrame(header, fg_color="transparent")
+        right.grid(row=0, column=2, padx=20, pady=10, sticky="e")
+        self.lbl_auth_status = ctk.CTkLabel(right, text="● Не подключено", text_color=COLORS["text_secondary"],
+                                            font=self._font(12, "bold"))
+        self.lbl_auth_status.pack(side="left", padx=(0, 14))
+        self.btn_test_conn = self._btn(right, "🔌 Подключиться", self._test_connection, "primary", 140)
+        self.btn_test_conn.pack(side="left")
 
-        # -- Operation progress row --
-        self.lbl_op_progress = self._label(mid_frame, "Progress: 0%", text_color=COLORS["text_secondary"])
-        self.lbl_op_progress.grid(row=5, column=0, columnspan=2, padx=(14, 4), pady=(0, 2), sticky="w")
-        self.pb_op = ctk.CTkProgressBar(mid_frame, height=8, progress_color=COLORS["primary"],
-                                        fg_color=COLORS["border"])
-        self.pb_op.grid(row=6, column=0, columnspan=3, padx=14, pady=(0, 12), sticky="ew")
-        self.pb_op.set(0)
+    def _build_sidebar(self, body):
+        side = self._panel(body)
+        side.grid(row=0, column=0, sticky="nsew")
+        side.grid_columnconfigure(0, weight=1)
+        side.grid_rowconfigure(6, weight=1)
+        pad = {"padx": 14}
 
-        # === 3. CHAT AREA ===
-        chat_frame = self._card(3, pady=6, sticky="nsew")
-        chat_frame.grid_columnconfigure(0, weight=1)
-        chat_frame.grid_rowconfigure(1, weight=1)
+        # Template
+        self._section(side, "Шаблон").grid(row=0, column=0, pady=(14, 4), sticky="ew", **pad)
+        prow = ctk.CTkFrame(side, fg_color="transparent")
+        prow.grid(row=1, column=0, sticky="ew", **pad)
+        prow.grid_columnconfigure(0, weight=1)
+        self.cb_presets = self._combo(prow, self.presets.names() or [NO_PRESETS], self._apply_preset)
+        self.cb_presets.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._btn(prow, "💾", self._save_preset, "secondary", 34).grid(row=0, column=1, padx=(0, 4))
+        self._btn(prow, "✖", self._delete_preset, "secondary", 34).grid(row=0, column=2)
 
-        self._title(chat_frame, "💬 Чат").grid(row=0, column=0, padx=14, pady=(10, 4), sticky="w")
+        # Notebook
+        self._section(side, "Блокнот").grid(row=2, column=0, pady=(16, 4), sticky="ew", **pad)
+        nrow = ctk.CTkFrame(side, fg_color="transparent")
+        nrow.grid(row=3, column=0, sticky="ew", **pad)
+        nrow.grid_columnconfigure(0, weight=1)
+        self.cb_notebooks = self._combo(nrow, [NOT_CONNECTED], self._on_notebook_selected)
+        self.cb_notebooks.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.btn_refresh_nb = self._btn(nrow, "⟳", self._refresh_notebooks, "secondary", 34)
+        self.btn_refresh_nb.grid(row=0, column=1)
 
-        self.txt_chat = ctk.CTkTextbox(chat_frame, wrap="word", state="disabled",
-                                       fg_color=COLORS["background"], text_color=COLORS["text"],
-                                       border_width=1, border_color=COLORS["border"],
-                                       font=ctk.CTkFont(family=FONT, size=13))
-        self.txt_chat.grid(row=1, column=0, padx=14, pady=4, sticky="nsew")
+        # Sources
+        shead = ctk.CTkFrame(side, fg_color="transparent")
+        shead.grid(row=4, column=0, pady=(16, 4), sticky="ew", **pad)
+        shead.grid_columnconfigure(0, weight=1)
+        self.lbl_sources = self._section(shead, "Источники")
+        self.lbl_sources.grid(row=0, column=0, sticky="w")
+        self._btn(shead, "⟳", self._refresh_sources_combo, "ghost", 28, 24).grid(row=0, column=1)
 
-        prompt_row = ctk.CTkFrame(chat_frame, fg_color="transparent")
-        prompt_row.grid(row=2, column=0, padx=14, pady=(4, 12), sticky="ew")
+        self.sources_list = ctk.CTkScrollableFrame(side, fg_color=COLORS["background"], corner_radius=6,
+                                                   border_width=1, border_color=COLORS["border"])
+        self.sources_list.grid(row=6, column=0, sticky="nsew", **pad)
+        self.sources_list.grid_columnconfigure(0, weight=1)
+
+        add = ctk.CTkFrame(side, fg_color="transparent")
+        add.grid(row=7, column=0, pady=(10, 14), sticky="ew", **pad)
+        add.grid_columnconfigure(0, weight=1)
+        self.url_entry = self._entry(add, "Вставьте ссылку и нажмите Enter")
+        self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.url_entry.bind("<Return>", lambda _: self._add_url_source())
+        self._btn(add, "＋", self._add_url_source, "secondary", 34).grid(row=0, column=1)
+        self._btn(add, "📄 Добавить файлы…", self._add_files, "secondary", 120).grid(
+            row=1, column=0, columnspan=2, pady=(6, 0), sticky="ew")
+
+        self._render_sources([], NOT_CONNECTED)
+
+    def _build_chat_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        self.txt_chat = self._textbox(tab)
+        self.txt_chat.grid(row=0, column=0, padx=6, pady=(4, 8), sticky="nsew")
+
+        prompt_row = ctk.CTkFrame(tab, fg_color="transparent")
+        prompt_row.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="ew")
         prompt_row.grid_columnconfigure(0, weight=1)
-
-        self.prompt_entry = self._entry(prompt_row, "Введите вопрос…")
-        self.prompt_entry.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.prompt_entry = self._entry(prompt_row, "Спросите что-нибудь об источниках блокнота…")
+        self.prompt_entry.configure(height=38)
+        self.prompt_entry.grid(row=0, column=0, padx=(0, 8), sticky="ew")
         self.prompt_entry.bind("<Return>", lambda _: self._send_query())
-
-        self.btn_send = self._btn(prompt_row, "📤 Отправить", self._send_query, "primary", 130)
+        self.btn_send = self._btn(prompt_row, SEND_TEXT, self._send_query, "primary", 130, 38)
         self.btn_send.grid(row=0, column=1)
 
-        # === 4. DEBUG PANEL ===
-        dbg_frame = self._card(4, pady=(6, 16))
+        self._chat_append("Подключитесь, выберите блокнот слева и задайте вопрос.\n")
 
-        self._title(dbg_frame, "🛠 Debug / Testing").pack(anchor="w", padx=14, pady=(10, 4))
-        btn_row = ctk.CTkFrame(dbg_frame, fg_color="transparent")
-        btn_row.pack(fill="x", padx=14, pady=(0, 10))
+    def _build_sync_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        self._title(tab, "Синхронизация папки с блокнотом").grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
+        self._hint(tab, "Выберите локальную папку — её файлы станут источниками выбранного блокнота. "
+                        "Папка сохраняется в шаблоне.").grid(row=1, column=0, padx=10, pady=(0, 12), sticky="w")
 
-        self._btn(btn_row, "🏓 Test API Status", self._test_api_status, "secondary", 160).pack(side="left", padx=(0, 8))
-        self._btn(btn_row, "🧪 Run Mock Query", self._run_mock_query, "secondary", 160).pack(side="left", padx=(0, 8))
-        self._btn(btn_row, "🗑 Clear Logs/Chat", self._clear_chat, "secondary", 160).pack(side="left", padx=(0, 8))
-        self._btn(btn_row, "📋 List Sources", self._list_sources, "secondary", 160).pack(side="left")
+        folder = self._panel(tab, fg_color=COLORS["background"])
+        folder.grid(row=2, column=0, padx=10, sticky="ew")
+        folder.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(folder, text="📁", font=ctk.CTkFont(size=22)).grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=12)
+        self.lbl_folder = self._label(folder, "Папка не выбрана", size=13)
+        self.lbl_folder.grid(row=0, column=1, sticky="ew", pady=(12, 0))
+        self.lbl_folder_info = self._hint(folder, "—")
+        self.lbl_folder_info.grid(row=1, column=1, sticky="ew", pady=(0, 12))
+        self._btn(folder, "Выбрать…", self._choose_folder_upload, "secondary", 110).grid(
+            row=0, column=2, rowspan=2, padx=14)
+
+        actions = ctk.CTkFrame(tab, fg_color="transparent")
+        actions.grid(row=3, column=0, padx=10, pady=(16, 0), sticky="ew")
+        actions.grid_columnconfigure(1, weight=1)
+
+        self.btn_reload = self._btn(actions, "♻  Reload", self._reload_folder, "primary", 190, 40)
+        self.btn_reload.grid(row=0, column=0, pady=(0, 10), sticky="w")
+        self._hint(actions, "Рекомендуется. Удаляет ВСЕ источники блокнота и загружает файлы папки заново — "
+                            "блокнот точно совпадёт с папкой.", 420).grid(row=0, column=1, padx=14, pady=(0, 10), sticky="w")
+
+        self.btn_reupload = self._btn(actions, "⬆  Только добавить", self._reupload_folder, "secondary", 190, 40)
+        self.btn_reupload.grid(row=1, column=0, sticky="w")
+        self._hint(actions, "Добавляет файлы папки к существующим источникам без удаления. "
+                            "Возможны дубликаты.", 420).grid(row=1, column=1, padx=14, sticky="w")
+
+        danger = self._panel(tab, fg_color=COLORS["danger_bg"], border_color=COLORS["danger_border"])
+        danger.grid(row=4, column=0, padx=10, pady=(24, 10), sticky="ew")
+        danger.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(danger, text="Опасная зона", text_color=COLORS["danger"], font=self._font(12, "bold"),
+                     anchor="w").grid(row=0, column=0, padx=14, pady=(10, 0), sticky="w")
+        self._hint(danger, "Удалить все источники блокнота без загрузки новых. Действие необратимо.", 420).grid(
+            row=1, column=0, padx=14, pady=(0, 10), sticky="w")
+        self._btn(danger, "Удалить все источники", self._delete_all_sources, "danger", 190).grid(
+            row=0, column=1, rowspan=2, padx=14)
+
+    def _build_log_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        self.txt_log = self._textbox(tab)
+        self.txt_log.configure(font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt_log.grid(row=0, column=0, padx=6, pady=(4, 8), sticky="nsew")
+        self._btn(tab, "Очистить журнал", self._clear_log, "secondary", 140).grid(row=1, column=0, padx=6, pady=(0, 6), sticky="e")
+
+    def _build_settings_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        self._title(tab, "Аккаунт Google").grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
+        self._hint(tab, "Первый раз нажмите «Войти через браузер», войдите в Google и подтвердите. "
+                        "Сессия сохраняется в файл; поле можно оставить пустым для пути по умолчанию.").grid(
+            row=1, column=0, padx=10, pady=(0, 8), sticky="w")
+
+        acc = ctk.CTkFrame(tab, fg_color="transparent")
+        acc.grid(row=2, column=0, padx=10, sticky="ew")
+        acc.grid_columnconfigure(0, weight=1)
+        self.storage_entry = self._entry(acc, "~/.notebooklm/storage_state.json (по умолчанию)")
+        self.storage_entry.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.btn_browser_login = self._btn(acc, "🌐 Войти через браузер", self._browser_login, "secondary", 180)
+        self.btn_browser_login.grid(row=0, column=1)
+
+        ctk.CTkFrame(tab, fg_color=COLORS["border"], height=1).grid(row=3, column=0, padx=10, pady=20, sticky="ew")
+
+        self._title(tab, "Диагностика").grid(row=4, column=0, padx=10, pady=(0, 8), sticky="w")
+        dbg = ctk.CTkFrame(tab, fg_color="transparent")
+        dbg.grid(row=5, column=0, padx=10, sticky="w")
+        for i, (text, cmd) in enumerate((
+            ("Проверить API", self._test_api_status),
+            ("Тестовый вопрос", self._run_mock_query),
+            ("Список источников в журнал", self._list_sources),
+            ("Очистить чат", self._clear_chat),
+        )):
+            self._btn(dbg, text, cmd, "secondary", 210).grid(row=i // 2, column=i % 2, padx=(0, 8), pady=(0, 8), sticky="w")
+
+    def _build_statusbar(self):
+        bar = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=30)
+        bar.grid(row=2, column=0, sticky="ew")
+        bar.grid_columnconfigure(0, weight=1)
+        self.lbl_status = ctk.CTkLabel(bar, text="Готово", text_color=COLORS["text_secondary"],
+                                       font=self._font(11), anchor="w")
+        self.lbl_status.grid(row=0, column=0, padx=20, pady=4, sticky="ew")
+        self.lbl_op_progress = ctk.CTkLabel(bar, text="", text_color=COLORS["text_secondary"], font=self._font(11))
+        self.lbl_op_progress.grid(row=0, column=1, padx=(0, 8))
+        self.pb_op = ctk.CTkProgressBar(bar, width=220, height=6, progress_color=COLORS["primary"],
+                                        fg_color=COLORS["border"])
+        self.pb_op.grid(row=0, column=2, padx=(0, 20))
+        self.pb_op.set(0)
+
+    # ------------------------------------------------- Status / sources UI --
+    def _set_status(self, text: str, kind: str = "muted"):
+        color = {"ok": COLORS["success"], "busy": COLORS["warning"], "error": COLORS["danger"]}.get(
+            kind, COLORS["text_secondary"])
+        self.lbl_auth_status.configure(text=f"● {text}", text_color=color)
+
+    def _render_sources(self, sources: list, placeholder: str | None = None):
+        for w in self.sources_list.winfo_children():
+            w.destroy()
+        self._source_rows = {}
+        if placeholder or not sources:
+            self.lbl_sources.configure(text="ИСТОЧНИКИ")
+            self._hint(self.sources_list, placeholder or "В блокноте нет источников", 260).grid(
+                row=0, column=0, padx=8, pady=10, sticky="w")
+            return
+        self.lbl_sources.configure(text=f"ИСТОЧНИКИ · {len(sources)}")
+        for i, src in enumerate(sources):
+            sid = self._source_id_of(src)
+            if not sid:
+                continue
+            title = self._source_title_of(src)
+            row = ctk.CTkFrame(self.sources_list, fg_color="transparent", corner_radius=4, height=30)
+            row.grid(row=i, column=0, sticky="ew", pady=1)
+            row.grid_columnconfigure(0, weight=1)
+            short = title if len(title) <= 34 else title[:33] + "…"
+            lbl = ctk.CTkLabel(row, text=f"{_kind_icon(self._source_kind_of(src))}  {short}", anchor="w",
+                               text_color=COLORS["text"], font=self._font(12), cursor="hand2")
+            lbl.grid(row=0, column=0, padx=(6, 0), sticky="ew")
+            delete = ctk.CTkButton(row, text="✕", width=24, height=24, corner_radius=4, fg_color="transparent",
+                                   hover_color=COLORS["danger_bg"], text_color=COLORS["text_secondary"],
+                                   font=self._font(12), command=lambda s=sid, t=title: self._delete_source(s, t))
+            delete.grid(row=0, column=1, padx=(2, 4))
+            for w in (row, lbl):
+                w.bind("<Button-1>", lambda _e, s=sid: self._select_source(s))
+            self._source_rows[sid] = row
+        if self._selected_source_id in self._source_rows:
+            self._select_source(self._selected_source_id)
+
+    def _select_source(self, sid: str):
+        self._selected_source_id = sid
+        for key, row in self._source_rows.items():
+            row.configure(fg_color=COLORS["selected"] if key == sid else "transparent")
 
     # -------------------------------------------------------- Chat helpers --
     def _chat_append(self, text: str, tag: str = ""):
@@ -343,6 +515,20 @@ class NotebookLMApp(ctk.CTk):
         self.txt_chat.insert("end", text + "\n")
         self.txt_chat.configure(state="disabled")
         self.txt_chat.see("end")
+
+    def _log(self, text: str):
+        """Technical messages go to the Журнал tab; the latest one is mirrored in the status bar."""
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", f"{stamp}  {text}\n")
+        self.txt_log.configure(state="disabled")
+        self.txt_log.see("end")
+        self.lbl_status.configure(text=re.sub(r"^\[[^\]]+\]\s*", "", text.strip()))
+
+    def _clear_log(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
 
     def _chat_clear(self):
         self.txt_chat.configure(state="normal")
@@ -367,7 +553,8 @@ class NotebookLMApp(ctk.CTk):
         return sync.client, nbs
 
     def _test_connection(self):
-        self.lbl_auth_status.configure(text="Статус: подключение…", text_color="orange")
+        self._set_status("Подключение…", "busy")
+        self.btn_test_conn.configure(state="disabled")
         path = self.storage_entry.get().strip() or None
 
         def _ok(result):
@@ -375,19 +562,23 @@ class NotebookLMApp(ctk.CTk):
             self.client = client
             self.notebooks = nbs
             self._populate_notebooks(nbs)
-            self.lbl_auth_status.configure(text=f"✅ Подключено — найдено {len(nbs)} блокнотов", text_color="green")
-            self._chat_append(f"[SYSTEM] Подключено. Блокнотов: {len(nbs)}")
+            self._set_status(f"Подключено · {len(nbs)} блокнотов", "ok")
+            self.btn_test_conn.configure(state="normal", text="⟳ Переподключить", fg_color=COLORS["background"],
+                                         hover_color=COLORS["selected"], text_color=COLORS["text"], border_width=1)
+            self._log(f"[SYSTEM] Подключено. Блокнотов: {len(nbs)}")
 
         def _err(exc):
-            self.lbl_auth_status.configure(text=f"❌ Ошибка: {exc}", text_color="red")
+            self._set_status("Ошибка подключения", "error")
+            self.btn_test_conn.configure(state="normal")
+            self._log(f"[ERROR] {exc}")
             messagebox.showerror("Connection Error", str(exc))
 
         self._schedule(self._connect(path), on_success=_ok, on_error=_err)
 
     def _browser_login(self):
         """Вход через Playwright (Edge) на notebook.google.com; сессия сохраняется в storage notebooklm-py."""
-        self.lbl_auth_status.configure(text="Статус: открывается браузер для входа…", text_color="orange")
-        self._chat_append("[SYSTEM] Откроется браузер — войдите в Google, затем подтвердите в окне программы.")
+        self._set_status("Вход через браузер…", "busy")
+        self._log("[SYSTEM] Откроется браузер — войдите в Google, затем подтвердите в окне программы.")
         threading.Thread(target=self._run_login, daemon=True).start()
 
     def _run_login(self):
@@ -400,24 +591,23 @@ class NotebookLMApp(ctk.CTk):
                     "Войдите в Google в открывшемся браузере.\nКогда увидите список блокнотов — нажмите OK."))
                 done.set()
 
-            self.after(0, _ask)
+            self._ui(_ask)
             done.wait()
             return answer[0]
 
         ok, msg = NotebookLMSync.browser_login(wait_callback=_confirm)
         if ok:
-            self.after(0, lambda: self.lbl_auth_status.configure(
-                text="✅ Вход выполнен — нажмите Test Connection", text_color="green"))
-            self.after(0, lambda: self._chat_append("[SYSTEM] Вход завершён. Нажмите 'Test Connection'."))
+            self._ui(lambda: self._log("[SYSTEM] Вход завершён. Подключаюсь…"))
+            self._ui(self._test_connection)
         else:
-            self.after(0, lambda: messagebox.showerror("Login Error", msg))
-            self.after(0, lambda: self.lbl_auth_status.configure(text="❌ Login failed", text_color="red"))
+            self._ui(lambda: messagebox.showerror("Login Error", msg))
+            self._ui(lambda: self._set_status("Вход не выполнен", "error"))
 
     # ---------------------------------------------------- Presets ----------
     def _refresh_presets_combo(self, select: str | None = None):
         names = self.presets.names()
-        self.cb_presets.configure(values=names or ["-- нет шаблонов --"])
-        self.cb_presets.set(select if select in names else (names[0] if names else "-- нет шаблонов --"))
+        self.cb_presets.configure(values=names or [NO_PRESETS])
+        self.cb_presets.set(select if select in names else (names[0] if names else NO_PRESETS))
 
     def _current_preset_data(self) -> dict:
         nb = next((n for n in self.notebooks if n.id == self.selected_nb_id), None)
@@ -441,7 +631,7 @@ class NotebookLMApp(ctk.CTk):
             return
         self.presets.put(name, self._current_preset_data())
         self._refresh_presets_combo(name)
-        self._chat_append(f"[PRESET] Сохранён: {name}")
+        self._log(f"[PRESET] Сохранён: {name}")
 
     def _apply_preset(self, name: str | None = None):
         name = name or self.cb_presets.get()
@@ -449,23 +639,23 @@ class NotebookLMApp(ctk.CTk):
         if not data:
             messagebox.showwarning("Шаблон", "Выберите сохранённый шаблон.")
             return
-        self.storage_entry.delete(0, "end")
         if data.get("storage_path"):
+            self.storage_entry.delete(0, "end")
             self.storage_entry.insert(0, data["storage_path"])
+        elif self.storage_entry.get():
+            self.storage_entry.delete(0, "end")
+            self.storage_entry._activate_placeholder()
 
         folder = data.get("folder")
         if folder:
-            self._folder_to_upload = Path(folder)
-            exists = self._folder_to_upload.exists()
-            self.lbl_folder.configure(text=self._folder_to_upload.name + ("" if exists else " (не найдена)"),
-                                      text_color=COLORS["text"] if exists else COLORS["danger"])
+            self._set_folder(Path(folder))
 
         self._pending_nb = {"id": data.get("notebook_id"), "title": data.get("notebook_title")}
         if self.notebooks:
             self._apply_pending_notebook()
         self.presets.touch(name)
         self.cb_presets.set(name)
-        self._chat_append(f"[PRESET] Применён: {name}")
+        self._log(f"[PRESET] Применён: {name}")
 
     def _apply_pending_notebook(self):
         pend, self._pending_nb = self._pending_nb, None
@@ -476,7 +666,7 @@ class NotebookLMApp(ctk.CTk):
                 self.cb_notebooks.set(nb.title)
                 self._on_notebook_selected(nb.title)
                 return
-        self._chat_append(f"[PRESET] Блокнот «{pend.get('title') or pend.get('id')}» не найден.")
+        self._log(f"[PRESET] Блокнот «{pend.get('title') or pend.get('id')}» не найден.")
 
     def _delete_preset(self):
         name = self.cb_presets.get()
@@ -494,26 +684,27 @@ class NotebookLMApp(ctk.CTk):
     # ---------------------------------------------------- Notebooks --------
     def _populate_notebooks(self, nbs):
         if not nbs:
-            self.cb_notebooks.configure(values=["-- нет блокнотов --"])
-            self.cb_notebooks.set("-- нет блокнотов --")
+            self.cb_notebooks.configure(values=["Нет блокнотов"])
+            self.cb_notebooks.set("Нет блокнотов")
+            self.selected_nb_id = None
+            self._render_sources([], "Нет блокнотов")
             return
         titles = [nb.title for nb in nbs]
         self.cb_notebooks.configure(values=titles)
-        self.cb_notebooks.set(titles[0])
-        self.selected_nb_id = nbs[0].id
         if self._pending_nb:
             self._apply_pending_notebook()
-            return
-        # Fetch source count for the first selected notebook
-        self._fetch_source_count(nbs[0].id, nbs[0].title)
-        self._refresh_sources_combo()
+            if self.selected_nb_id in {nb.id for nb in nbs}:
+                return
+        current = next((nb for nb in nbs if nb.id == self.selected_nb_id), nbs[0])
+        self.cb_notebooks.set(current.title)
+        self._on_notebook_selected(current.title)
 
     def _on_notebook_selected(self, choice: str):
         idx = self.cb_notebooks.cget("values").index(choice) if choice in self.cb_notebooks.cget("values") else -1
         if 0 <= idx < len(self.notebooks):
             self.selected_nb_id = self.notebooks[idx].id
-            self._chat_append(f"[SYSTEM] Выбран блокнот: {self.notebooks[idx].title}")
-            self._fetch_source_count(self.notebooks[idx].id, self.notebooks[idx].title)
+            self._selected_source_id = None
+            self._log(f"[SYSTEM] Выбран блокнот: {self.notebooks[idx].title}")
             self._refresh_sources_combo()
 
     def _source_id_of(self, src) -> str | None:
@@ -530,65 +721,31 @@ class NotebookLMApp(ctk.CTk):
         return str(getattr(src, "kind", "?"))
 
     def _populate_sources(self, sources: list):
-        self._sources_cache = list(sources)
-        self._source_display_to_id = {}
-        values = []
-        for i, src in enumerate(sources, 1):
-            sid = self._source_id_of(src)
-            if not sid:
-                continue
-            display = f"{i}. [{self._source_kind_of(src)}] {self._source_title_of(src)}"
-            self._source_display_to_id[display] = sid
-            values.append(display)
-
-        if not values:
-            self._selected_source_id = None
-            self.cb_sources.configure(values=["-- источников нет --"])
-            self.cb_sources.set("-- источников нет --")
-            return
-
-        self.cb_sources.configure(values=values)
-        self.cb_sources.set(values[0])
-        self._selected_source_id = self._source_display_to_id.get(values[0])
-
-    def _on_source_selected(self, choice: str):
-        self._selected_source_id = self._source_display_to_id.get(choice)
+        self._render_sources(list(sources))
 
     def _refresh_sources_combo(self):
         if not self.client or not self.selected_nb_id:
-            self.cb_sources.configure(values=["-- сначала подключитесь --"])
-            self.cb_sources.set("-- сначала подключитесь --")
             self._selected_source_id = None
+            self._render_sources([], NOT_CONNECTED)
             return
 
         nb_id = self.selected_nb_id
+        self._render_sources([], "Загрузка…")
 
         async def _fetch():
             return await self.client.sources.list(nb_id)
 
         def _ok(sources):
+            if nb_id != self.selected_nb_id:
+                return
             self._populate_sources(sources)
-            self._chat_append(f"[SOURCES] Обновлено: {len(sources)}")
+            self._log(f"[SOURCES] Обновлено: {len(sources)}")
 
         self._schedule(_fetch(), on_success=_ok)
 
-    def _fetch_source_count(self, nb_id: str, title: str):
-        """Fetch actual source count for a notebook."""
-        if not self.client:
-            return
-
-        async def _count():
-            sources = await self.client.sources.list(nb_id)
-            return len(sources)
-
-        def _ok(count):
-            self._chat_append(f"   📎 Источников: {count}")
-
-        self._schedule(_count(), on_success=_ok)
-
     def _refresh_notebooks(self):
         if not self.client:
-            messagebox.showwarning("Нет подключения", "Сначала подключитесь (Test Connection).")
+            messagebox.showwarning("Нет подключения", "Сначала нажмите «Подключиться».")
             return
 
         async def _fetch():
@@ -597,12 +754,12 @@ class NotebookLMApp(ctk.CTk):
         def _ok(nbs):
             self.notebooks = nbs
             self._populate_notebooks(nbs)
-            self._chat_append(f"[SYSTEM] Список обновлён: {len(nbs)} блокнотов")
+            self._log(f"[SYSTEM] Список обновлён: {len(nbs)} блокнотов")
 
         self._schedule(_fetch(), on_success=_ok)
 
     # ---------------------------------------------------- Sources ----------
-    def _set_progress(self, current: int, total: int, prefix: str = "Progress"):
+    def _set_progress(self, current: int, total: int, prefix: str = "Прогресс"):
         if total <= 0:
             pct = 0
             value = 0.0
@@ -614,11 +771,22 @@ class NotebookLMApp(ctk.CTk):
 
     def _reset_progress(self):
         self.pb_op.set(0)
-        self.lbl_op_progress.configure(text="Progress: 0%")
+        self.lbl_op_progress.configure(text="")
 
-    def _choose_file(self):
-        path = filedialog.askopenfilename(
-            title="Выберите файл для загрузки",
+    def _require_notebook(self) -> bool:
+        if not self.client:
+            messagebox.showwarning("Нет подключения", "Сначала нажмите «Подключиться».")
+            return False
+        if not self.selected_nb_id:
+            messagebox.showwarning("Блокнот", "Выберите блокнот.")
+            return False
+        return True
+
+    def _add_files(self):
+        if not self._require_notebook():
+            return
+        paths = filedialog.askopenfilenames(
+            title="Выберите файлы для загрузки",
             filetypes=[
                 ("Все поддерживаемые", "*.pdf *.txt *.md *.docx *.csv *.png *.jpg *.jpeg *.mp3 *.mp4 *.wav"),
                 ("PDF", "*.pdf"), ("Text", "*.txt *.md"), ("Word", "*.docx"),
@@ -627,34 +795,18 @@ class NotebookLMApp(ctk.CTk):
                 ("All files", "*.*"),
             ],
         )
-        if path:
-            self._file_to_upload = Path(path)
-            self.lbl_file.configure(text=self._file_to_upload.name, text_color=COLORS["text"])
-
-    def _upload_source(self):
-        if not self.client:
-            messagebox.showwarning("Нет подключения", "Сначала подключитесь.")
+        if not paths:
             return
-        if not self.selected_nb_id:
-            messagebox.showwarning("Блокнот", "Выберите блокнот.")
-            return
-        if not self._file_to_upload:
-            messagebox.showwarning("Файл", "Сначала выберите файл.")
-            return
-
+        files = [Path(p) for p in paths]
         nb_id = self.selected_nb_id
-        fpath = self._file_to_upload
+        self._log(f"[UPLOAD] Загрузка {len(files)} файл(ов)…")
 
-        async def _upload():
-            return await self.client.sources.add_file(nb_id, fpath)
+        def _ok(result):
+            uploaded, errors = result
+            self._log(f"[UPLOAD] Готово: загружено {uploaded}, ошибок {errors}")
+            self._refresh_sources_combo()
 
-        def _ok(src):
-            title = getattr(src, "title", fpath.name)
-            self._chat_append(f"[SOURCE] Загружен: {title}")
-            messagebox.showinfo("Готово", f"Файл «{title}» загружен в блокнот.")
-
-        self._chat_append(f"[UPLOAD] Загрузка {fpath.name}…")
-        self._schedule(_upload(), on_success=_ok)
+        self._schedule(self._upload_all_coro(nb_id, files, "Загрузка"), on_success=_ok)
 
     def _add_url_source(self):
         if not self.client:
@@ -673,10 +825,11 @@ class NotebookLMApp(ctk.CTk):
 
         def _ok(src):
             title = getattr(src, "title", url)
-            self._chat_append(f"[SOURCE] URL добавлен: {title}")
+            self._log(f"[SOURCE] URL добавлен: {title}")
             self.url_entry.delete(0, "end")
+            self._refresh_sources_combo()
 
-        self._chat_append(f"[URL] Добавление {url}…")
+        self._log(f"[URL] Добавление {url}…")
         self._schedule(_add(), on_success=_ok)
 
     def _list_sources(self):
@@ -692,13 +845,13 @@ class NotebookLMApp(ctk.CTk):
         def _ok(sources):
             self._populate_sources(sources)
             if not sources:
-                self._chat_append("[SOURCES] Источников нет.")
+                self._log("[SOURCES] Источников нет.")
                 return
-            self._chat_append(f"[SOURCES] Источники ({len(sources)}):")
+            self._log(f"[SOURCES] Источники ({len(sources)}):")
             for i, src in enumerate(sources, 1):
                 kind = getattr(src, "kind", "?")
                 title = getattr(src, "title", "—")
-                self._chat_append(f"  {i}. [{kind}] {title}")
+                self._log(f"  {i}. [{kind}] {title}")
 
         self._schedule(_fetch(), on_success=_ok)
 
@@ -728,28 +881,20 @@ class NotebookLMApp(ctk.CTk):
             "NotebookLM API does not expose sources.delete/remove in this version."
         )
 
-    def _delete_selected_source(self):
-        if not self.client or not self.selected_nb_id:
-            messagebox.showwarning("Нет подключения", "Сначала подключитесь и выберите блокнот.")
+    def _delete_source(self, src_id: str, title: str):
+        if not self._require_notebook():
             return
-        if not self._selected_source_id:
-            messagebox.showwarning("Источник", "Выберите источник для удаления.")
+        if not messagebox.askyesno("Удалить источник", f"Удалить «{title}» из блокнота?"):
             return
-
-        if not messagebox.askyesno("Подтверждение", "Удалить выбранный источник из блокнота?"):
-            return
-
         nb_id = self.selected_nb_id
-        src_id = self._selected_source_id
-
-        async def _delete_one():
-            return await self._delete_source_api(nb_id, src_id)
 
         def _ok(_):
-            self._chat_append("[DELETE] Источник удален.")
+            self._log(f"[DELETE] Удалён: {title}")
+            if self._selected_source_id == src_id:
+                self._selected_source_id = None
             self._refresh_sources_combo()
 
-        self._schedule(_delete_one(), on_success=_ok)
+        self._schedule(self._delete_source_api(nb_id, src_id), on_success=_ok)
 
     def _delete_all_sources(self):
         if not self.client or not self.selected_nb_id:
@@ -766,7 +911,7 @@ class NotebookLMApp(ctk.CTk):
 
         def _ok(result):
             deleted, errors = result
-            self._chat_append(f"[DELETE ALL] Готово: удалено {deleted}, ошибок {errors}")
+            self._log(f"[DELETE ALL] Готово: удалено {deleted}, ошибок {errors}")
             self._set_progress(deleted + errors, max(deleted + errors, 1), "Delete all")
             self._refresh_sources_combo()
 
@@ -777,7 +922,7 @@ class NotebookLMApp(ctk.CTk):
         total = len(sources)
         deleted = 0
         errors = 0
-        self.after(0, lambda: self._set_progress(0, total, prefix))
+        self._ui(lambda: self._set_progress(0, total, prefix))
         for src in sources:
             sid = self._source_id_of(src)
             title = self._source_title_of(src)
@@ -787,36 +932,46 @@ class NotebookLMApp(ctk.CTk):
                 try:
                     await self._delete_source_api(nb_id, sid)
                     deleted += 1
-                    self.after(0, lambda t=title: self._chat_append(f"  🗑 {t}"))
+                    self._ui(lambda t=title: self._log(f"  🗑 {t}"))
                 except Exception as e:
                     errors += 1
-                    self.after(0, lambda t=title, err=str(e): self._chat_append(f"  ❌ {t}: {err}"))
+                    self._ui(lambda t=title, err=str(e): self._log(f"  ❌ {t}: {err}"))
             done = deleted + errors
-            self.after(0, lambda d=done, t=total: self._set_progress(d, t, prefix))
+            self._ui(lambda d=done, t=total: self._set_progress(d, t, prefix))
         return deleted, errors
 
     async def _upload_all_coro(self, nb_id: str, files: list[Path], prefix: str = "Reupload"):
         total = len(files)
         uploaded = 0
         errors = 0
-        self.after(0, lambda: self._set_progress(0, total, prefix))
+        self._ui(lambda: self._set_progress(0, total, prefix))
         for i, fpath in enumerate(files, 1):
             try:
                 await self.client.sources.add_file(nb_id, fpath)
                 uploaded += 1
-                self.after(0, lambda n=fpath.name, a=i, t=total: self._chat_append(f"  ☁️ [{a}/{t}] {n}"))
+                self._ui(lambda n=fpath.name, a=i, t=total: self._log(f"  ☁️ [{a}/{t}] {n}"))
             except Exception as e:
                 errors += 1
-                self.after(0, lambda n=fpath.name, err=str(e): self._chat_append(f"  ❌ {n}: {err}"))
+                self._ui(lambda n=fpath.name, err=str(e): self._log(f"  ❌ {n}: {err}"))
             done = uploaded + errors
-            self.after(0, lambda d=done, t=total: self._set_progress(d, t, prefix))
+            self._ui(lambda d=done, t=total: self._set_progress(d, t, prefix))
         return uploaded, errors
+
+    def _set_folder(self, folder: Path):
+        self._folder_to_upload = folder
+        if not folder.exists():
+            self.lbl_folder.configure(text=folder.name, text_color=COLORS["danger"])
+            self.lbl_folder_info.configure(text=f"Папка не найдена: {folder}")
+            return
+        count = sum(1 for f in folder.rglob("*") if f.is_file() and not f.name.startswith(".")
+                    and f.suffix.lower() in _SUPPORTED_UPLOAD_EXTS)
+        self.lbl_folder.configure(text=folder.name, text_color=COLORS["text"])
+        self.lbl_folder_info.configure(text=f"{folder}  ·  {count} поддерживаемых файлов")
 
     def _choose_folder_upload(self):
         folder = filedialog.askdirectory(title="Выберите папку для полной перезагрузки")
         if folder:
-            self._folder_to_upload = Path(folder)
-            self.lbl_folder.configure(text=self._folder_to_upload.name, text_color=COLORS["text"])
+            self._set_folder(Path(folder))
 
     def _collect_folder_files(self) -> list[Path] | None:
         """Validate connection/notebook/folder and return files to upload, or None."""
@@ -854,11 +1009,11 @@ class NotebookLMApp(ctk.CTk):
 
         nb_id = self.selected_nb_id
         self.btn_reload.configure(state="disabled")
-        self._chat_append(f"[RELOAD] Старт: удаление всех источников → загрузка {len(files)} файлов")
+        self._log(f"[RELOAD] Старт: удаление всех источников → загрузка {len(files)} файлов")
 
         async def _reload():
             deleted, del_err = await self._wipe_all_coro(nb_id, "Reload: delete")
-            self.after(0, lambda: self._chat_append(f"[RELOAD] Удалено {deleted}, ошибок {del_err}. Загрузка…"))
+            self._ui(lambda: self._log(f"[RELOAD] Удалено {deleted}, ошибок {del_err}. Загрузка…"))
             if del_err:
                 return deleted, 0, 0, True
             uploaded, up_err = await self._upload_all_coro(nb_id, files, "Reload: upload")
@@ -871,13 +1026,13 @@ class NotebookLMApp(ctk.CTk):
         def _ok(result):
             deleted, uploaded, up_err, aborted = result
             if aborted:
-                self._chat_append("[RELOAD] ⚠ Прервано: часть источников не удалена, загрузка не выполнялась.")
+                self._log("[RELOAD] ⚠ Прервано: часть источников не удалена, загрузка не выполнялась.")
             else:
-                self._chat_append(f"[RELOAD] Готово: удалено {deleted}, загружено {uploaded}, ошибок {up_err}")
+                self._log(f"[RELOAD] Готово: удалено {deleted}, загружено {uploaded}, ошибок {up_err}")
             _done()
 
         def _err(exc):
-            self._chat_append(f"[RELOAD] ❌ {exc}")
+            self._log(f"[RELOAD] ❌ {exc}")
             _done()
             messagebox.showerror("Reload", str(exc))
 
@@ -895,11 +1050,11 @@ class NotebookLMApp(ctk.CTk):
             return
 
         nb_id = self.selected_nb_id
-        self._chat_append(f"[REUPLOAD] Старт: {len(files)} файлов из {self._folder_to_upload}")
+        self._log(f"[REUPLOAD] Старт: {len(files)} файлов из {self._folder_to_upload}")
 
         def _ok(result):
             uploaded, errors = result
-            self._chat_append(f"[REUPLOAD] Готово: загружено {uploaded}, ошибок {errors}")
+            self._log(f"[REUPLOAD] Готово: загружено {uploaded}, ошибок {errors}")
             self._set_progress(uploaded + errors, max(uploaded + errors, 1), "Reupload")
             self._refresh_sources_combo()
 
@@ -931,7 +1086,7 @@ class NotebookLMApp(ctk.CTk):
             if result.references:
                 refs = ", ".join(f"[{r.citation_number}]" for r in result.references if r.citation_number)
                 if refs:
-                    self._chat_append(f"   📚 Ссылки: {refs}")
+                    self._log(f"   📚 Ссылки: {refs}")
             self.btn_send.configure(state="normal", text="📤 Отправить")
 
         def _err(exc):
@@ -948,14 +1103,14 @@ class NotebookLMApp(ctk.CTk):
             messagebox.showwarning("Нет подключения", "Сначала подключитесь.")
             return
 
-        self._chat_append("[DEBUG] Проверка API…")
+        self._log("[DEBUG] Проверка API…")
 
         async def _ping():
             nbs = await self.client.notebooks.list()
             return len(nbs)
 
         def _ok(count):
-            self._chat_append(f"[DEBUG] ✅ API доступен. Блокнотов: {count}")
+            self._log(f"[DEBUG] ✅ API доступен. Блокнотов: {count}")
             messagebox.showinfo("API Status", f"API работает.\nБлокнотов: {count}")
 
         self._schedule(_ping(), on_success=_ok)
@@ -991,7 +1146,7 @@ class NotebookLMApp(ctk.CTk):
 
     def _clear_chat(self):
         self._chat_clear()
-        self._chat_append("[SYSTEM] Лог очищен.\n")
+        self._log("[SYSTEM] Лог очищен.\n")
 
 
 # ---------------------------------------------------------------------------
