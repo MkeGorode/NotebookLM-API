@@ -373,8 +373,11 @@ class NotebookLMApp(ctk.CTk):
         self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.url_entry.bind("<Return>", lambda _: self._add_url_source())
         self._btn(add, "Добавить", self._add_url_source, "secondary", 80).grid(row=0, column=1)
-        self._btn(add, "📄 Добавить файлы…", self._add_files, "secondary", 120).grid(
-            row=1, column=0, columnspan=2, pady=(6, 0), sticky="ew")
+        picks = ctk.CTkFrame(add, fg_color="transparent")
+        picks.grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky="ew")
+        picks.grid_columnconfigure((0, 1), weight=1, uniform="pick")
+        self._btn(picks, "📄 Файлы…", self._add_files, "secondary", 60).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self._btn(picks, "📁 Папка…", self._choose_folder_upload, "secondary", 60).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         self._render_sources([], NOT_CONNECTED)
 
@@ -1202,6 +1205,17 @@ class NotebookLMApp(ctk.CTk):
         self._start_job("Загрузка файлов", f"{len(files)} шт.", nb_id, self._selected_nb_title(),
                         lambda ev: eng.upload_many(client, nb_id, files, conc, ev))
 
+    def _add_menu(self):
+        """Popup under the entry: choose files to upload or a source folder for sync."""
+        menu = tkinter.Menu(self, tearoff=0, font=(FONT, 10))
+        menu.add_command(label="📄  Загрузить файлы…", command=self._add_files)
+        menu.add_command(label="📁  Выбрать папку-источник (для синхронизации)…", command=self._choose_folder_upload)
+        x, y = self.url_entry.winfo_rootx(), self.url_entry.winfo_rooty() + self.url_entry.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
     def _add_url_source(self):
         """Add a source from the entry: URL → web source, file path → upload, folder path → source folder.
 
@@ -1209,7 +1223,7 @@ class NotebookLMApp(ctk.CTk):
         """
         raw = self.url_entry.get().strip().strip('"')
         if not raw:
-            self._add_files()
+            self._add_menu()
             return
         local = Path(raw).expanduser()
         if not raw.lower().startswith(("http://", "https://", "www.")) and local.exists():
